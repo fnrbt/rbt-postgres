@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Fspg</RootNamespace>
+    <AssemblyName>Fspg</AssemblyName>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <WarningLevel>3</WarningLevel>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Wire.fs" />
+    <Compile Include="Messages.fs" />
+    <Compile Include="Errors.fs" />
+    <Compile Include="Tls.fs" />
+    <Compile Include="Scram.fs" />
+    <Compile Include="Oids.fs" />
+    <Compile Include="Codecs.fs" />
+    <Compile Include="Connection.fs" />
+    <Compile Include="Replication.fs" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,19 @@
+# .NET build output
+bin/
+obj/
+
+# Test runtime artifacts (provisioned by tests/setup-postgres.sh)
+# run/ is the bind-mounted Unix socket directory
+run/
+# tests/certs holds the generated TLS CA + server cert/key (private keys)
+tests/certs/
+
+# IDE / editor
+.vs/
+.idea/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db

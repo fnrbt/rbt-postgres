@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/Fspg.Sample/Fspg.Sample.fsproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Fspg/Fspg.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Fspg.Tests/Fspg.Tests.fsproj" />
+  </Folder>
+</Solution>
