@@ -26,6 +26,8 @@ Rbt.Postgres.slnx
 | **Parameters** | sent in **binary** for types with a binary encoder (int/bool/float/`bytea`/`uuid`/date-time), text otherwise — chosen per the parameter's type OID |
 | **Encodings** | `client_encoding` resolved from the server and applied in both directions — SQL text, value decoding, and text params (UTF8, LATIN1, …) |
 | **Streaming** | row-limited `IAsyncEnumerable<PgRow>` cursor (bounded memory) |
+| **Row-limited execute** | `ExecuteLimitedAsync` returns at most N rows and whether more were left, under the command timeout |
+| **Notices** | NoticeResponse messages arrive on `Connection.NoticeReceived`; nothing is written to the console |
 | **COPY** | `COPY FROM/TO STDIN` in text and binary formats |
 | **Cancellation** | graceful: a fired `CancellationToken`/timeout sends a server `CancelRequest` and drains the query cleanly, so the connection stays usable; explicit `CancelAsync()` too |
 | **LISTEN/NOTIFY** | async notifications via event + `WaitForNotificationAsync` |

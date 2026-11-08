@@ -30,6 +30,11 @@ type ResultSet =
       Rows: string option [] list
       CommandTag: string }
 
+/// A row-limited result: `Truncated` when the statement had more rows.
+type LimitedResult =
+    { Result: ResultSet
+      Truncated: bool }
+
 /// An async LISTEN/NOTIFY notification.
 type Notification =
     { Pid: int
@@ -77,6 +82,7 @@ type PgRowStream
      parameters: obj option list,
      batchSize: int,
      encoding: System.Text.Encoding,
+     onNotice: PostgresErrorFields -> unit,
      ct: CancellationToken) =
 
     let decodeRow (pgcols: PgColumn[]) (m: IncomingMessage) =
@@ -161,7 +167,7 @@ type PgRowStream
                         batching <- false
                         do! transport.SendAsync(sync (), ct)
                         do! this.DrainToReady()
-                    | 'N' -> eprintfn "NOTICE: %s" (ErrorFields.format (ErrorFields.parse m))
+                    | 'N' -> onNotice (ErrorFields.parse m)
                     | 'E' -> batching <- false; do! raiseError (ErrorFields.parse m)
                     | other -> failwithf "Unexpected '%c' while streaming rows." other
             }
@@ -212,6 +218,7 @@ type Connection(config: ConnConfig) =
     let stmtCache = Dictionary<string, string>() // sql -> prepared statement name
     let notifications = Queue<Notification>()
     let notifyEvent = Event<Notification>()
+    let noticeEvent = Event<PostgresErrorFields>()
     let mutable dataEncoding : System.Text.Encoding = utf8 // resolved from client_encoding
 
     let applyParameterStatus (k: string) (v: string) =
@@ -361,7 +368,7 @@ type Connection(config: ConnConfig) =
                 | 'K' -> // BackendKeyData
                     backendPid <- msg.Int32()
                     backendKey <- msg.Int32()
-                | 'N' -> eprintfn "NOTICE: %s" (ErrorFields.format (ErrorFields.parse msg))
+                | 'N' -> noticeEvent.Trigger(ErrorFields.parse msg)
                 | 'v' -> () // NegotiateProtocolVersion: server downgraded / unknown opts — proceed
                 | 'Z' -> ready <- true // ReadyForQuery
                 | 'E' -> raise (PostgresException(ErrorFields.parse msg))
@@ -446,12 +453,15 @@ type Connection(config: ConnConfig) =
                 | 'n' -> () // NoData
                 | '1' | '2' | '3' -> () // ParseComplete / BindComplete / CloseComplete
                 | 't' -> () // ParameterDescription
-                | 's' -> () // PortalSuspended
+                | 's' -> // PortalSuspended: a row-limited Execute stopped with rows left
+                    results.Add({ ResultSet.Columns = columns; Rows = List.ofSeq rows; CommandTag = "" })
+                    columns <- [||]
+                    rows <- List<string option []>()
                 | 'S' -> // ParameterStatus (e.g. after SET client_encoding)
                     let k = msg.CString()
                     let v = msg.CString()
                     applyParameterStatus k v
-                | 'N' -> eprintfn "NOTICE: %s" (ErrorFields.format (ErrorFields.parse msg))
+                | 'N' -> noticeEvent.Trigger(ErrorFields.parse msg)
                 | 'A' -> recordNotification msg // NotificationResponse (LISTEN/NOTIFY)
                 | 'E' -> pendingError <- Some(ErrorFields.parse msg)
                 | 'Z' -> ready <- true
@@ -530,6 +540,45 @@ type Connection(config: ConnConfig) =
 
     member this.Execute(sql: string, parameters: string option list) =
         this.ExecuteAsync(sql, parameters).GetAwaiter().GetResult()
+
+    /// Like `ExecuteAsync`, but returns at most `maxRows` rows: the portal's
+    /// Execute is row-limited (one row past the limit, to learn whether any
+    /// were left) and the rest of the result is never sent. `Truncated` says
+    /// whether rows were left. The command timeout and
+    /// cancellation apply as for every query. One statement only (the
+    /// extended protocol refuses several).
+    member this.ExecuteLimitedAsync
+        (sql: string, parameters: string option list, maxRows: int, ?cancellationToken: CancellationToken)
+        : Task<LimitedResult> =
+        if maxRows < 1 then invalidArg "maxRows" "maxRows must be at least 1"
+        let userCt = defaultArg cancellationToken CancellationToken.None
+        this.RunCancellableAsync(
+            (fun tok ->
+                task {
+                    transport.Enqueue(parse dataEncoding "" sql [])
+                    transport.Enqueue(bind "" "" parameters)
+                    transport.Enqueue(describePortal "")
+                    // One row past the limit: the server suspends a portal
+                    // whenever it reaches the limit, rows left or not, so only
+                    // the extra row says whether any were left.
+                    transport.Enqueue(execute "" (maxRows + 1))
+                    transport.Enqueue(sync ())
+                    do! transport.FlushAsync(tok)
+                    let! results = this.CollectUntilReadyAsync(tok)
+                    let result =
+                        match results with
+                        | [] -> { ResultSet.Columns = [||]; Rows = []; CommandTag = "" }
+                        | many -> List.last many
+                    let truncated = result.Rows.Length > maxRows
+                    return
+                        { Result = if truncated then { result with Rows = List.truncate maxRows result.Rows } else result
+                          Truncated = truncated }
+                }),
+            userCt,
+            this.CommandTimeout)
+
+    member this.ExecuteLimited(sql: string, parameters: string option list, maxRows: int) =
+        this.ExecuteLimitedAsync(sql, parameters, maxRows).GetAwaiter().GetResult()
 
     // ---- Typed extended query (binary results where supported) --------------
 
@@ -614,7 +663,7 @@ type Connection(config: ConnConfig) =
                     rows.Add(PgRow(pgcols, vals))
                 | 'C' -> tag <- m.CString()
                 | 's' -> () // PortalSuspended (not used here)
-                | 'N' -> eprintfn "NOTICE: %s" (ErrorFields.format (ErrorFields.parse m))
+                | 'N' -> noticeEvent.Trigger(ErrorFields.parse m)
                 | 'E' -> err <- Some(ErrorFields.parse m)
                 | 'Z' -> ready <- true
                 | other -> failwithf "Unexpected message '%c' while reading typed rows." other
@@ -651,7 +700,7 @@ type Connection(config: ConnConfig) =
                 | 'C' -> tag <- m.CString()
                 | 's' -> ()
                 | 'A' -> recordNotification m
-                | 'N' -> eprintfn "NOTICE: %s" (ErrorFields.format (ErrorFields.parse m))
+                | 'N' -> noticeEvent.Trigger(ErrorFields.parse m)
                 | 'E' -> err <- Some(ErrorFields.parse m)
                 | 'Z' -> ready <- true
                 | other -> failwithf "Unexpected message '%c' reading rows." other
@@ -766,7 +815,7 @@ type Connection(config: ConnConfig) =
         let ps = defaultArg parameters []
         let bs = defaultArg batchSize 100
         let ct = defaultArg cancellationToken CancellationToken.None
-        PgRowStream(transport, sql, ps, bs, dataEncoding, ct) :> IAsyncEnumerable<PgRow>
+        PgRowStream(transport, sql, ps, bs, dataEncoding, noticeEvent.Trigger, ct) :> IAsyncEnumerable<PgRow>
 
     // ---- COPY protocol -------------------------------------------------------
 
@@ -898,6 +947,10 @@ type Connection(config: ConnConfig) =
 
     /// Raised whenever a NotificationResponse is observed during message reads.
     member _.NotificationReceived = notifyEvent.Publish
+
+    /// NoticeResponse messages (warnings, notices) the server sends during any
+    /// operation. Nothing is written to the console; subscribe to see them.
+    member _.NoticeReceived = noticeEvent.Publish
 
     /// Pull a notification already buffered from earlier message processing.
     member _.DequeueNotification() =

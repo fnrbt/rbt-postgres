@@ -20,6 +20,7 @@
     <Compile Include="Phase10Tests.fs" />
     <Compile Include="Phase11Tests.fs" />
     <Compile Include="Phase12Tests.fs" />
+    <Compile Include="Phase13Tests.fs" />
   </ItemGroup>
 
   <ItemGroup>
