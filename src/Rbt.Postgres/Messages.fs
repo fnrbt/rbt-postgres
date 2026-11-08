@@ -1,6 +1,6 @@
-namespace Fspg
+namespace Rbt.Postgres
 
-open Fspg.Wire
+open Rbt.Postgres.Wire
 
 /// Typed views over the PostgreSQL message set we care about.
 module Messages =

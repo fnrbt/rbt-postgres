@@ -3,7 +3,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <AssemblyName>fspg-sample</AssemblyName>
+    <AssemblyName>rbt-postgres-sample</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>
@@ -11,7 +11,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/Fspg/Fspg.fsproj" />
+    <ProjectReference Include="../../src/Rbt.Postgres/Rbt.Postgres.fsproj" />
   </ItemGroup>
 
 </Project>

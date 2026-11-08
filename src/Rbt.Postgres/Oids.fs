@@ -1,4 +1,4 @@
-namespace Fspg
+namespace Rbt.Postgres
 
 /// Object identifiers for the built-in PostgreSQL types this client decodes.
 /// (From the catalog; stable across versions.)

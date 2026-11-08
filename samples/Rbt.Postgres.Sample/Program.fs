@@ -1,7 +1,7 @@
-module Fspg.Program
+module Rbt.Postgres.Program
 
 open System
-open Fspg
+open Rbt.Postgres
 
 // ---- Pretty-printing a result set ------------------------------------------
 
@@ -70,19 +70,19 @@ let private buildConfig (argv: string[]) =
         match Map.tryFind k args with
         | Some v -> v
         | None -> envOr env fallback
-    let user = get "user" "FSPG_USER" "tester"
-    let password = get "password" "FSPG_PASSWORD" "secret"
-    let database = get "db" "FSPG_DB" "testdb"
-    let port = get "port" "FSPG_PORT" "5432" |> int
+    let user = get "user" "RBT_POSTGRES_USER" "tester"
+    let password = get "password" "RBT_POSTGRES_PASSWORD" "secret"
+    let database = get "db" "RBT_POSTGRES_DB" "testdb"
+    let port = get "port" "RBT_POSTGRES_PORT" "5432" |> int
 
-    // A Unix socket is used when --socket / FSPG_SOCKET is set. The value may be
+    // A Unix socket is used when --socket / RBT_POSTGRES_SOCKET is set. The value may be
     // a full socket path or a directory (PostgreSQL convention: the socket file
     // is <dir>/.s.PGSQL.<port>).
     let socketArg =
         match Map.tryFind "socket" args with
         | Some v -> Some v
         | None ->
-            match Environment.GetEnvironmentVariable "FSPG_SOCKET" with
+            match Environment.GetEnvironmentVariable "RBT_POSTGRES_SOCKET" with
             | null | "" -> None
             | v -> Some v
 
@@ -93,7 +93,7 @@ let private buildConfig (argv: string[]) =
                 if s.Contains(".s.PGSQL.") then s
                 else IO.Path.Combine(s, $".s.PGSQL.{port}")
             Unix path
-        | None -> Tcp(get "host" "FSPG_HOST" "127.0.0.1", port)
+        | None -> Tcp(get "host" "RBT_POSTGRES_HOST" "127.0.0.1", port)
 
     { Endpoint = endpoint
       User = user
@@ -124,16 +124,16 @@ let private runScenarios (conn: Connection) =
         printResult rs
 
     section "DDL + DML round-trip"
-    conn.Query("DROP TABLE IF EXISTS fspg_demo") |> ignore
+    conn.Query("DROP TABLE IF EXISTS rbtpg_demo") |> ignore
     conn.Query(
-        "CREATE TABLE fspg_demo (
+        "CREATE TABLE rbtpg_demo (
             id    serial PRIMARY KEY,
             name  text NOT NULL,
             score int,
             tags  text[])") |> ignore
-    printfn "  created table fspg_demo"
+    printfn "  created table rbtpg_demo"
     for rs in conn.Query(
-                  "INSERT INTO fspg_demo (name, score, tags) VALUES
+                  "INSERT INTO rbtpg_demo (name, score, tags) VALUES
                        ('alice', 10, ARRAY['a','b']),
                        ('bob',   20, ARRAY['c']),
                        ('carol', NULL, NULL)
@@ -143,7 +143,7 @@ let private runScenarios (conn: Connection) =
     section "Extended query protocol (parameterized, $1/$2)"
     let rs =
         conn.Execute(
-            "SELECT id, name, score FROM fspg_demo
+            "SELECT id, name, score FROM rbtpg_demo
              WHERE score >= $1 OR score IS NULL
              ORDER BY id",
             [ Some "15" ])
@@ -152,14 +152,14 @@ let private runScenarios (conn: Connection) =
     section "Extended query protocol (text + int params, RETURNING)"
     let inserted =
         conn.Execute(
-            "INSERT INTO fspg_demo (name, score) VALUES ($1, $2) RETURNING id, name, score",
+            "INSERT INTO rbtpg_demo (name, score) VALUES ($1, $2) RETURNING id, name, score",
             [ Some "dave"; Some "99" ])
     printResult inserted
 
     section "Aggregate"
     for rs in conn.Query(
                   "SELECT count(*) AS n, avg(score)::numeric(10,2) AS avg_score,
-                          max(name) AS last_name FROM fspg_demo") do
+                          max(name) AS last_name FROM rbtpg_demo") do
         printResult rs
 
     section "Typed decoding (binary results → native .NET types)"
@@ -188,7 +188,7 @@ let private runScenarios (conn: Connection) =
     for rs in conn.Query("SELECT 'still alive' AS status") do
         printResult rs
 
-    conn.Query("DROP TABLE IF EXISTS fspg_demo") |> ignore
+    conn.Query("DROP TABLE IF EXISTS rbtpg_demo") |> ignore
 
 // ---- Entry point -----------------------------------------------------------
 
@@ -199,7 +199,7 @@ let main argv =
         match config.Endpoint with
         | Tcp(h, p) -> $"tcp {h}:{p}"
         | Unix path -> $"unix {path}"
-    printfn "fspg — F# PostgreSQL wire-protocol client"
+    printfn "rbt-postgres — F# PostgreSQL wire-protocol client"
     printfn "connecting: %s  user=%s db=%s" where config.User config.Database
     try
         use conn = new Connection(config)

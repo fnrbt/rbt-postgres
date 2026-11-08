@@ -1,11 +1,11 @@
-namespace Fspg.Tests
+namespace Rbt.Postgres.Tests
 
 open System
 open System.Collections.Generic
 open System.Text
 open System.Threading.Tasks
 open Xunit
-open Fspg
+open Rbt.Postgres
 
 [<Collection("postgres")>]
 type Phase10Tests(fixture: PostgresFixture) =
@@ -26,7 +26,7 @@ type Phase10Tests(fixture: PostgresFixture) =
         fixture.Require()
         Assert.True(TestConfig.isTcp fixture.Config, "needs TCP")
         task {
-            let slot = "fspg_slot"
+            let slot = "rbtpg_slot"
             use repl = fixture.NewConnection()
             repl.ReplicationMode <- Some "database" // logical replication
             repl.Open()
@@ -35,11 +35,11 @@ type Phase10Tests(fixture: PostgresFixture) =
 
             // Make changes on a separate, normal connection.
             use work = fixture.Connect()
-            work.Query("DROP TABLE IF EXISTS fspg_repl") |> ignore
-            work.Query("CREATE TABLE fspg_repl (id int primary key, name text)") |> ignore
-            work.Query("INSERT INTO fspg_repl VALUES (1,'alice'),(2,'bob')") |> ignore
-            work.Query("UPDATE fspg_repl SET name='ALICE' WHERE id=1") |> ignore
-            work.Query("DELETE FROM fspg_repl WHERE id=2") |> ignore
+            work.Query("DROP TABLE IF EXISTS rbtpg_repl") |> ignore
+            work.Query("CREATE TABLE rbtpg_repl (id int primary key, name text)") |> ignore
+            work.Query("INSERT INTO rbtpg_repl VALUES (1,'alice'),(2,'bob')") |> ignore
+            work.Query("UPDATE rbtpg_repl SET name='ALICE' WHERE id=1") |> ignore
+            work.Query("DELETE FROM rbtpg_repl WHERE id=2") |> ignore
 
             // Stream and collect decoded text until we observe the DELETE.
             let collected = List<string>()
@@ -50,13 +50,13 @@ type Phase10Tests(fixture: PostgresFixture) =
                     not (s.Contains "DELETE"))
 
             let all = String.Join("\n", collected)
-            Assert.Contains("table public.fspg_repl", all)
+            Assert.Contains("table public.rbtpg_repl", all)
             Assert.Contains("INSERT", all)
             Assert.Contains("UPDATE", all)
             Assert.Contains("DELETE", all)
 
             Replication.dropSlot repl slot
-            work.Query("DROP TABLE IF EXISTS fspg_repl") |> ignore
+            work.Query("DROP TABLE IF EXISTS rbtpg_repl") |> ignore
         }
 
     [<Fact>]
@@ -64,24 +64,24 @@ type Phase10Tests(fixture: PostgresFixture) =
         fixture.Require()
         Assert.True(TestConfig.isTcp fixture.Config, "needs TCP")
         task {
-            let slot = "fspg_pgo_slot"
-            let pub = "fspg_pub"
+            let slot = "rbtpg_pgo_slot"
+            let pub = "rbtpg_pub"
             use repl = fixture.NewConnection()
             repl.ReplicationMode <- Some "database"
             repl.Open()
 
             use work = fixture.Connect()
-            work.Query("DROP TABLE IF EXISTS fspg_pgo CASCADE") |> ignore
-            work.Query("CREATE TABLE fspg_pgo (id int primary key, name text)") |> ignore
+            work.Query("DROP TABLE IF EXISTS rbtpg_pgo CASCADE") |> ignore
+            work.Query("CREATE TABLE rbtpg_pgo (id int primary key, name text)") |> ignore
             work.Query(sprintf "DROP PUBLICATION IF EXISTS %s" pub) |> ignore
-            work.Query(sprintf "CREATE PUBLICATION %s FOR TABLE fspg_pgo" pub) |> ignore
+            work.Query(sprintf "CREATE PUBLICATION %s FOR TABLE rbtpg_pgo" pub) |> ignore
 
             Replication.dropSlot repl slot
             Replication.createLogicalSlot repl slot "pgoutput"
 
-            work.Query("INSERT INTO fspg_pgo VALUES (1,'alice'),(2,'bob')") |> ignore
-            work.Query("UPDATE fspg_pgo SET name='ALICE' WHERE id=1") |> ignore
-            work.Query("DELETE FROM fspg_pgo WHERE id=2") |> ignore
+            work.Query("INSERT INTO rbtpg_pgo VALUES (1,'alice'),(2,'bob')") |> ignore
+            work.Query("UPDATE rbtpg_pgo SET name='ALICE' WHERE id=1") |> ignore
+            work.Query("DELETE FROM rbtpg_pgo WHERE id=2") |> ignore
 
             let msgs = List<PgOutput.Message>()
             do!
@@ -98,7 +98,7 @@ type Phase10Tests(fixture: PostgresFixture) =
             let rel = msgs |> Seq.tryPick (function PgOutput.Relation(_, _, n, cols) -> Some(n, cols) | _ -> None)
             Assert.True(rel.IsSome)
             let relName, cols = rel.Value
-            Assert.Equal("fspg_pgo", relName)
+            Assert.Equal("rbtpg_pgo", relName)
             Assert.True([| "id"; "name" |] = cols)
             // INSERTs carry the new tuples (decoded per column)
             let inserts =
@@ -112,5 +112,5 @@ type Phase10Tests(fixture: PostgresFixture) =
 
             Replication.dropSlot repl slot
             work.Query(sprintf "DROP PUBLICATION IF EXISTS %s" pub) |> ignore
-            work.Query("DROP TABLE IF EXISTS fspg_pgo CASCADE") |> ignore
+            work.Query("DROP TABLE IF EXISTS rbtpg_pgo CASCADE") |> ignore
         }

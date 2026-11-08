@@ -29,7 +29,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/Fspg/Fspg.fsproj" />
+    <ProjectReference Include="../../src/Rbt.Postgres/Rbt.Postgres.fsproj" />
   </ItemGroup>
 
 </Project>

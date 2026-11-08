@@ -1,8 +1,8 @@
-namespace Fspg.Tests
+namespace Rbt.Postgres.Tests
 
 open System.Threading.Tasks
 open Xunit
-open Fspg
+open Rbt.Postgres
 
 [<Collection("postgres")>]
 type Phase5Tests(fixture: PostgresFixture) =
@@ -33,12 +33,12 @@ type Phase5Tests(fixture: PostgresFixture) =
         fixture.Require()
         task {
             use conn = fixture.Connect()
-            conn.Query("DROP TABLE IF EXISTS fspg_stream") |> ignore
-            conn.Query("CREATE TABLE fspg_stream AS SELECT g AS id FROM generate_series(1,2500) g")
+            conn.Query("DROP TABLE IF EXISTS rbtpg_stream") |> ignore
+            conn.Query("CREATE TABLE rbtpg_stream AS SELECT g AS id FROM generate_series(1,2500) g")
             |> ignore
             let mutable count = 0
             let mutable sum = 0L
-            let e = conn.Stream("SELECT id FROM fspg_stream ORDER BY id", batchSize = 100).GetAsyncEnumerator()
+            let e = conn.Stream("SELECT id FROM rbtpg_stream ORDER BY id", batchSize = 100).GetAsyncEnumerator()
             let mutable go = true
             while go do
                 let! has = e.MoveNextAsync()
@@ -50,7 +50,7 @@ type Phase5Tests(fixture: PostgresFixture) =
             do! e.DisposeAsync()
             Assert.Equal(2500, count)
             Assert.Equal(2500L * 2501L / 2L, sum)
-            conn.Query("DROP TABLE IF EXISTS fspg_stream") |> ignore
+            conn.Query("DROP TABLE IF EXISTS rbtpg_stream") |> ignore
         }
 
     [<Fact>]
@@ -58,14 +58,14 @@ type Phase5Tests(fixture: PostgresFixture) =
         fixture.Require()
         task {
             use conn = fixture.Connect()
-            conn.Query("DROP TABLE IF EXISTS fspg_stream2") |> ignore
-            conn.Query("CREATE TABLE fspg_stream2 AS SELECT g FROM generate_series(1,500) g")
+            conn.Query("DROP TABLE IF EXISTS rbtpg_stream2") |> ignore
+            conn.Query("CREATE TABLE rbtpg_stream2 AS SELECT g FROM generate_series(1,500) g")
             |> ignore
-            let e = conn.Stream("SELECT g FROM fspg_stream2 ORDER BY g", batchSize = 10).GetAsyncEnumerator()
+            let e = conn.Stream("SELECT g FROM rbtpg_stream2 ORDER BY g", batchSize = 10).GetAsyncEnumerator()
             let! _ = e.MoveNextAsync() // read only the first row
             do! e.DisposeAsync() // abandon the rest
             // The connection must be clean and usable again.
             let rs = conn.Query("SELECT 1 AS x") |> List.exactlyOne
             Assert.Equal(Some "1", rs.Rows |> List.head |> Array.head)
-            conn.Query("DROP TABLE IF EXISTS fspg_stream2") |> ignore
+            conn.Query("DROP TABLE IF EXISTS rbtpg_stream2") |> ignore
         }

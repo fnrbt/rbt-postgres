@@ -1,6 +1,6 @@
-namespace Fspg
+namespace Rbt.Postgres
 
-open Fspg.Wire
+open Rbt.Postgres.Wire
 
 /// Decoder for the `pgoutput` logical replication message format (protocol
 /// version 1) — what `CREATE SUBSCRIPTION` / real CDC streams. Each XLogData

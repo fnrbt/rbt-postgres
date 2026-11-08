@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/Rbt.Postgres.Sample/Rbt.Postgres.Sample.fsproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Rbt.Postgres/Rbt.Postgres.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Rbt.Postgres.Tests/Rbt.Postgres.Tests.fsproj" />
+  </Folder>
+</Solution>

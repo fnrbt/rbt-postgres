@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Stand up a self-contained Kerberos KDC + GSSAPI-enabled PostgreSQL inside a
-# single Podman container, then verify the fspg client authenticates via GSSAPI.
+# single Podman container, then verify the rbt-postgres client authenticates via GSSAPI.
 #
 # Everything (KDC, Postgres, the .NET client) runs in one container so there is
 # no host Kerberos config to manage and no cross-container DNS to get right.
-# Teardown:  podman rm -f fspg-krb
+# Teardown:  podman rm -f rbt-postgres-krb
 set -euo pipefail
 
-NAME="${FSPG_KRB_CONTAINER:-fspg-krb}"
+NAME="${RBT_POSTGRES_KRB_CONTAINER:-rbt-postgres-krb}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 podman rm -f "$NAME" >/dev/null 2>&1 || true
@@ -71,15 +71,15 @@ sleep 2
 su postgres -c "psql -tAc \"CREATE ROLE tester LOGIN SUPERUSER;\"" >/dev/null
 su postgres -c "psql -tAc \"CREATE DATABASE tester OWNER tester;\"" >/dev/null'
 
-echo "[4/4] verifying the fspg client authenticates via GSSAPI ..."
+echo "[4/4] verifying the rbt-postgres client authenticates via GSSAPI ..."
 podman exec "$NAME" bash -lc '
 set -e
-rm -rf /tmp/fspg && mkdir -p /tmp/fspg
-cp -r /work/src /work/samples /work/fspg.slnx /tmp/fspg/
-cd /tmp/fspg
-dotnet build samples/Fspg.Sample/Fspg.Sample.fsproj -c Release -v quiet --nologo >/dev/null
+rm -rf /tmp/rbt-postgres && mkdir -p /tmp/rbt-postgres
+cp -r /work/src /work/samples /work/Rbt.Postgres.slnx /tmp/rbt-postgres/
+cd /tmp/rbt-postgres
+dotnet build samples/Rbt.Postgres.Sample/Rbt.Postgres.Sample.fsproj -c Release -v quiet --nologo >/dev/null
 echo testerpw | kinit tester@EXAMPLE.COM
-dotnet run --project samples/Fspg.Sample -c Release --no-build -- \
+dotnet run --project samples/Rbt.Postgres.Sample -c Release --no-build -- \
   --host pghost --port 5432 --user tester --password ignored --db tester'
 
 echo

@@ -1,11 +1,11 @@
-namespace Fspg.Tests
+namespace Rbt.Postgres.Tests
 
 open System.Text
 open System.Threading.Tasks
 open Xunit
-open Fspg
-open Fspg.Wire
-open Fspg.Messages
+open Rbt.Postgres
+open Rbt.Postgres.Wire
+open Rbt.Postgres.Messages
 
 [<Collection("postgres")>]
 type Phase9Tests(fixture: PostgresFixture) =

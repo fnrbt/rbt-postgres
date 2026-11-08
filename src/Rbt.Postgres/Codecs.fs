@@ -1,11 +1,11 @@
-namespace Fspg
+namespace Rbt.Postgres
 
 open System
 open System.Buffers.Binary
 open System.Collections.Concurrent
 open System.Globalization
 open System.Text
-open Fspg.Wire
+open Rbt.Postgres.Wire
 
 /// Map a PostgreSQL client_encoding name to a .NET Encoding for the bytes↔string
 /// step. Falls back to UTF-8 for names .NET can't resolve.
@@ -94,7 +94,7 @@ module Codecs =
     let private span (b: byte[]) = ReadOnlySpan<byte>(b)
 
     /// User-registered codecs, consulted before the built-ins. The escape hatch
-    /// for any type fspg doesn't decode natively (inet, hstore, composites, …).
+    /// for any type rbt-postgres doesn't decode natively (inet, hstore, composites, …).
     let private custom = ConcurrentDictionary<int, Codec>()
 
     // PostgreSQL stores temporal binary values relative to 2000-01-01.

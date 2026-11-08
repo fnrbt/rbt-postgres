@@ -2,8 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <RootNamespace>Fspg</RootNamespace>
-    <AssemblyName>Fspg</AssemblyName>
+    <RootNamespace>Rbt.Postgres</RootNamespace>
+    <AssemblyName>Rbt.Postgres</AssemblyName>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <WarningLevel>3</WarningLevel>
   </PropertyGroup>

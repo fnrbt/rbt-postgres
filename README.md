@@ -1,4 +1,4 @@
-# fspg — an F# PostgreSQL wire-protocol client
+# rbt-postgres — an F# PostgreSQL wire-protocol client
 
 A from-scratch implementation of the PostgreSQL frontend/backend protocol (v3.0)
 in F#, with **no dependency on Npgsql or libpq**. It speaks the raw wire protocol
@@ -6,10 +6,10 @@ over TCP or a Unix-domain socket, and is verified end-to-end against PostgreSQL
 running in Podman.
 
 ```
-fspg.slnx
-├─ src/Fspg/            # the client library
-├─ samples/Fspg.Sample/ # a runnable console demo
-└─ tests/Fspg.Tests/    # xUnit integration tests (run against Podman)
+Rbt.Postgres.slnx
+├─ src/Rbt.Postgres/            # the client library
+├─ samples/Rbt.Postgres.Sample/ # a runnable console demo
+└─ tests/Rbt.Postgres.Tests/    # xUnit integration tests (run against Podman)
 ```
 
 ## Feature matrix
@@ -66,7 +66,7 @@ dotnet build -c Release
 dotnet test -c Release
 
 # 4. Run the console demo
-dotnet run -c Release --project samples/Fspg.Sample -- \
+dotnet run -c Release --project samples/Rbt.Postgres.Sample -- \
     --host 127.0.0.1 --port 55432 --user tester --password secret --db testdb \
     --sslmode verify-full --sslrootcert tests/certs/root.crt
 ```
@@ -74,18 +74,18 @@ dotnet run -c Release --project samples/Fspg.Sample -- \
 The demo also runs over a Unix socket:
 
 ```bash
-dotnet run -c Release --project samples/Fspg.Sample -- \
+dotnet run -c Release --project samples/Rbt.Postgres.Sample -- \
     --socket ./run --port 5432 --user tester --password secret --db testdb
 ```
 
 Connection settings can come from CLI flags (`--host/--port/--socket/--user/
---password/--db/--sslmode/--sslrootcert`) or env vars (`FSPG_HOST`, `FSPG_PORT`,
-`FSPG_SOCKET`, `FSPG_USER`, `FSPG_PASSWORD`, `FSPG_DB`).
+--password/--db/--sslmode/--sslrootcert`) or env vars (`RBT_POSTGRES_HOST`, `RBT_POSTGRES_PORT`,
+`RBT_POSTGRES_SOCKET`, `RBT_POSTGRES_USER`, `RBT_POSTGRES_PASSWORD`, `RBT_POSTGRES_DB`).
 
 ## API sketch
 
 ```fsharp
-open Fspg
+open Rbt.Postgres
 
 // Simple + typed queries
 use conn = new Connection({ Endpoint = Tcp("127.0.0.1", 55432)
@@ -108,7 +108,7 @@ let! n = conn.CopyInTextAsync("COPY t FROM STDIN", [ "1\ta"; "2\tb" ])
 conn.Listen("chan");  let! note = conn.WaitForNotificationAsync(TimeSpan.FromSeconds 5.)
 do! conn.CancelAsync()
 
-// Register a custom codec for any type fspg doesn't model natively
+// Register a custom codec for any type rbt-postgres doesn't model natively
 Codecs.registerText 869 (fun s -> box (System.Net.IPAddress.Parse s)) // inet -> IPAddress
 ```
 
@@ -133,7 +133,7 @@ Honest boundaries. None affect the supported feature set; they're scope edges.
   than a bespoke .NET type (`interval`, ranges and arrays *do* get typed values).
   For any of these, register your own codec — `Codecs.registerText 869 (fun s ->
   box (IPAddress.Parse s))` — and `QueryTyped` will return your type. This escape
-  hatch covers every type without fspg having to model all of them.
+  hatch covers every type without rbt-postgres having to model all of them.
 - **`numeric`** decodes via text → `decimal` (lossless), not the binary format.
 - **Binary parameters** cover the core scalar types (int/bool/float/`bytea`/
   `uuid`/date-time); other parameter types are sent as text (also lossless).
@@ -148,14 +148,14 @@ Honest boundaries. None affect the supported feature set; they're scope edges.
 
 ## Test container
 
-`tests/setup-postgres.sh` (re)creates the `fspg-test` container with everything
+`tests/setup-postgres.sh` (re)creates the `rbt-postgres-test` container with everything
 the suite needs: TCP on `55432`, a bind-mounted Unix socket at `./run`, TLS
 (`ssl=on`, generated CA at `tests/certs/root.crt`), `wal_level=logical`, and
 `pg_hba` rules + roles for the md5/cleartext/replication tests. Teardown:
-`podman rm -f fspg-test`.
+`podman rm -f rbt-postgres-test`.
 
 `tests/setup-kerberos.sh` is a separate, self-contained verification of the
 GSSAPI path: it builds a Kerberos KDC + GSS-enabled PostgreSQL + the .NET client
 in a single container and runs the client through a real Kerberos login
-(`mechanism=GSS`). Teardown: `podman rm -f fspg-krb`.
+(`mechanism=GSS`). Teardown: `podman rm -f rbt-postgres-krb`.
 ```

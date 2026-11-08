@@ -1,9 +1,9 @@
-namespace Fspg.Tests
+namespace Rbt.Postgres.Tests
 
 open System
 open System.Threading.Tasks
 open Xunit
-open Fspg
+open Rbt.Postgres
 
 [<Collection("postgres")>]
 type Phase7Tests(fixture: PostgresFixture) =
@@ -33,13 +33,13 @@ type Phase7Tests(fixture: PostgresFixture) =
         task {
             use listener = fixture.Connect()
             use notifier = fixture.Connect()
-            listener.Listen("fspg_chan")
+            listener.Listen("rbtpg_chan")
             // Give the LISTEN a moment to register, then notify from the other conn.
-            notifier.Query("NOTIFY fspg_chan, 'hello world'") |> ignore
+            notifier.Query("NOTIFY rbtpg_chan, 'hello world'") |> ignore
             let! got = listener.WaitForNotificationAsync(TimeSpan.FromSeconds 5.0)
             match got with
             | Some n ->
-                Assert.Equal("fspg_chan", n.Channel)
+                Assert.Equal("rbtpg_chan", n.Channel)
                 Assert.Equal("hello world", n.Payload)
             | None -> failwith "no notification received within timeout"
         }
@@ -49,7 +49,7 @@ type Phase7Tests(fixture: PostgresFixture) =
         fixture.Require()
         task {
             use conn = fixture.Connect()
-            conn.Listen("fspg_quiet")
+            conn.Listen("rbtpg_quiet")
             let! got = conn.WaitForNotificationAsync(TimeSpan.FromMilliseconds 300.0)
             Assert.True(got.IsNone)
             // connection still usable after the timed-out wait

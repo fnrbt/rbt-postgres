@@ -1,4 +1,4 @@
-namespace Fspg
+namespace Rbt.Postgres
 
 open System
 open System.Buffers

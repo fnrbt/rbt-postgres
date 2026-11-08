@@ -1,4 +1,4 @@
-namespace Fspg
+namespace Rbt.Postgres
 
 open System
 open System.Buffers.Binary
@@ -8,8 +8,8 @@ open System.Security.Cryptography
 open System.Text
 open System.Threading
 open System.Threading.Tasks
-open Fspg.Wire
-open Fspg.Messages
+open Rbt.Postgres.Wire
+open Rbt.Postgres.Messages
 
 /// Where to reach the server: a TCP host/port or a Unix-domain socket.
 /// The wire protocol is identical over both transports.
@@ -406,7 +406,7 @@ type Connection(config: ConnConfig) =
                 let baseParams =
                     [ "user", config.User
                       "database", config.Database
-                      "application_name", "fspg"
+                      "application_name", "rbt-postgres"
                       "client_encoding", this.ClientEncoding ]
                 match this.ReplicationMode with
                 | Some v -> baseParams @ [ "replication", v ]
@@ -672,7 +672,7 @@ type Connection(config: ConnConfig) =
                 | Some n -> n
                 | None ->
                     stmtCounter <- stmtCounter + 1
-                    sprintf "fspg_s%d" stmtCounter
+                    sprintf "rbtpg_s%d" stmtCounter
             transport.Enqueue(parse dataEncoding stmtName sql [])
             transport.Enqueue(describeStatement stmtName)
             transport.Enqueue(sync ())

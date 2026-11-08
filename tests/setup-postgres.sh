@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision the PostgreSQL container used by the Fspg integration tests.
+# Provision the PostgreSQL container used by the Rbt.Postgres integration tests.
 # Idempotent: re-running recreates the container from scratch.
 #
 # Configures everything later phases need:
@@ -10,12 +10,12 @@
 #   - test roles: md5user/md5pass (md5), clearuser/clearpass (scram-stored)
 set -euo pipefail
 
-NAME="${FSPG_CONTAINER:-fspg-test}"
-IMAGE="${FSPG_IMAGE:-docker.io/library/postgres:18}"
-HOST_PORT="${FSPG_PORT:-55432}"
-PGUSER="${FSPG_USER:-tester}"
-PGPASS="${FSPG_PASSWORD:-secret}"
-PGDB="${FSPG_DB:-testdb}"
+NAME="${RBT_POSTGRES_CONTAINER:-rbt-postgres-test}"
+IMAGE="${RBT_POSTGRES_IMAGE:-docker.io/library/postgres:18}"
+HOST_PORT="${RBT_POSTGRES_PORT:-55432}"
+PGUSER="${RBT_POSTGRES_USER:-tester}"
+PGPASS="${RBT_POSTGRES_PASSWORD:-secret}"
+PGDB="${RBT_POSTGRES_DB:-testdb}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNDIR="$ROOT/run"
@@ -27,7 +27,7 @@ if [[ ! -f "$CERTDIR/server.crt" ]]; then
   echo "generating TLS certificates in $CERTDIR"
   openssl req -new -x509 -days 3650 -nodes -newkey rsa:2048 \
     -keyout "$CERTDIR/root.key" -out "$CERTDIR/root.crt" \
-    -subj "/CN=fspg-test-ca" >/dev/null 2>&1
+    -subj "/CN=rbt-postgres-test-ca" >/dev/null 2>&1
   openssl req -new -nodes -newkey rsa:2048 \
     -keyout "$CERTDIR/server.key" -out "$CERTDIR/server.csr" \
     -subj "/CN=localhost" >/dev/null 2>&1

@@ -1,8 +1,8 @@
-namespace Fspg
+namespace Rbt.Postgres
 
 open System
 open System.Security.Cryptography
-open Fspg.Wire
+open Rbt.Postgres.Wire
 
 /// SCRAM-SHA-256 and SCRAM-SHA-256-PLUS (RFC 5802 / RFC 7677). SCRAM is the
 /// default authentication mechanism for modern PostgreSQL; the -PLUS variant

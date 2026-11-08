@@ -1,7 +1,7 @@
-namespace Fspg.Tests
+namespace Rbt.Postgres.Tests
 
 open Xunit
-open Fspg
+open Rbt.Postgres
 
 /// Shared fixture: probes the configured PostgreSQL server once. If it is not
 /// reachable, tests are skipped (never silently passed) with a message pointing

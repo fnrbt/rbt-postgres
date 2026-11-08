@@ -1,11 +1,11 @@
-namespace Fspg.Tests
+namespace Rbt.Postgres.Tests
 
 open System
 open System.Diagnostics
 open System.Threading
 open System.Threading.Tasks
 open Xunit
-open Fspg
+open Rbt.Postgres
 
 [<Collection("postgres")>]
 type Phase1Tests(fixture: PostgresFixture) =
@@ -39,16 +39,16 @@ type Phase1Tests(fixture: PostgresFixture) =
     member _.``a constraint violation surfaces SqlState and ConstraintName``() =
         fixture.Require()
         use conn = fixture.Connect()
-        conn.Query("DROP TABLE IF EXISTS fspg_p1") |> ignore
-        conn.Query("CREATE TABLE fspg_p1 (id int PRIMARY KEY)") |> ignore
-        conn.Query("INSERT INTO fspg_p1 VALUES (1)") |> ignore
+        conn.Query("DROP TABLE IF EXISTS rbtpg_p1") |> ignore
+        conn.Query("CREATE TABLE rbtpg_p1 (id int PRIMARY KEY)") |> ignore
+        conn.Query("INSERT INTO rbtpg_p1 VALUES (1)") |> ignore
         let ex =
             Assert.Throws<PostgresException>(fun () ->
-                conn.Query("INSERT INTO fspg_p1 VALUES (1)") |> ignore)
+                conn.Query("INSERT INTO rbtpg_p1 VALUES (1)") |> ignore)
         Assert.Equal("23505", ex.SqlState) // unique_violation
         Assert.True(ex.ConstraintName.IsSome, "expected a constraint name")
-        Assert.Equal("fspg_p1_pkey", ex.ConstraintName.Value)
+        Assert.Equal("rbtpg_p1_pkey", ex.ConstraintName.Value)
         // Connection remains usable after an error.
         let rs = conn.Query("SELECT 'ok' AS s") |> List.exactlyOne
         Assert.Equal(Some "ok", rs.Rows |> List.head |> Array.head)
-        conn.Query("DROP TABLE IF EXISTS fspg_p1") |> ignore
+        conn.Query("DROP TABLE IF EXISTS rbtpg_p1") |> ignore

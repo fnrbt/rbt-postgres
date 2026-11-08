@@ -1,7 +1,7 @@
-namespace Fspg
+namespace Rbt.Postgres
 
 open System
-open Fspg.Wire
+open Rbt.Postgres.Wire
 
 /// Every field PostgreSQL can put in an ErrorResponse / NoticeResponse message
 /// (see protocol "Error and Notice Message Fields"). Optional fields are

@@ -1,10 +1,10 @@
-namespace Fspg.Tests
+namespace Rbt.Postgres.Tests
 
 open System
 open System.Threading
 open System.Threading.Tasks
 open Xunit
-open Fspg
+open Rbt.Postgres
 
 [<Collection("postgres")>]
 type Phase12Tests(fixture: PostgresFixture) =
