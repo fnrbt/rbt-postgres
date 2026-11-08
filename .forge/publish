@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Build and publish the Rbt.Postgres NuGet package to the Forge registry.
+
+Runs inside the Forge publish-action shell. The coordinator's executor mints a
+scoped `fpk_` publisher from the action's `packages.publish` declaration and
+injects `FORGE_PACKAGE_SOURCE` (the registry v3 index URL) and
+`FORGE_PACKAGE_API_KEYS` (a JSON prefix->token map). Rbt.Postgres is a leaf package
+(only implicit FSharp.Core from nuget.org), so a plain `dotnet pack` is enough;
+no dependency-graph rewrite is required.
+
+The version is supplied in FORGE_VERSION by the publish action, taken from the
+pushed version tag (refs/tags/vX.Y.Z). Re-publishing an already-present
+immutable version returns HTTP 409, treated as a successful no-op so
+re-pushing the same tag is safe.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+def main() -> int:
+    repo = Path(__file__).resolve().parent.parent
+
+    version = os.environ.get("FORGE_VERSION", "").strip()
+    if not version:
+        fail("FORGE_VERSION is required (set by the publish action from the version tag)")
+
+    source = os.environ.get("FORGE_PACKAGE_SOURCE")
+    if not source:
+        fail("FORGE_PACKAGE_SOURCE is required")
+
+    try:
+        api_keys = json.loads(os.environ.get("FORGE_PACKAGE_API_KEYS") or "{}")
+    except json.JSONDecodeError as error:
+        fail(f"FORGE_PACKAGE_API_KEYS is not valid JSON: {error}")
+    api_key = api_keys.get("Rbt.Postgres")
+    if not api_key:
+        fail("FORGE_PACKAGE_API_KEYS has no Rbt.Postgres publisher token")
+
+    source_sha = os.environ.get("FORGE_SOURCE_SHA", "")
+
+    # Build in an out-of-tree work directory so the checkout stays clean.
+    workdir = Path(tempfile.mkdtemp(prefix="rbt-postgres-publish-"))
+
+    # Rbt.Postgres's only dependency is FSharp.Core from nuget.org. Pin the source
+    # explicitly so packing does not depend on the sandbox's default config.
+    nuget_config = workdir / "NuGet.Config"
+    nuget_config.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<configuration>\n"
+        "  <packageSources>\n"
+        "    <clear />\n"
+        '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />\n'
+        "  </packageSources>\n"
+        "</configuration>\n",
+        encoding="utf-8",
+    )
+
+    output = workdir / "nupkg"
+    project = "src/Rbt.Postgres/Rbt.Postgres.fsproj"
+    command = [
+        "dotnet",
+        "pack",
+        project,
+        "-c",
+        "Release",
+        "--configfile",
+        str(nuget_config),
+        f"-p:Version={version}",
+        f"-p:PackageVersion={version}",
+        f"-p:RepositoryCommit={source_sha}",
+        "-p:ContinuousIntegrationBuild=true",
+        "-p:IncludeSymbols=false",
+        "-o",
+        str(output),
+    ]
+    print("+ " + " ".join(command), flush=True)
+    subprocess.run(command, check=True, cwd=repo)
+
+    packages = [path for path in output.glob("*.nupkg") if ".symbols." not in path.name]
+    if len(packages) != 1:
+        fail(f"expected exactly one package, produced {sorted(map(str, packages))}")
+    package = packages[0]
+
+    endpoint = publish_endpoint(source)
+    boundary = "----ForgePackage" + uuid.uuid4().hex
+    prefix = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="package"; filename="{package.name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    body = prefix + package.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        method="PUT",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-NuGet-ApiKey": api_key,
+            "X-Forge-Source-Sha": source_sha,
+            "X-Forge-Version-Mode": "explicit",
+        },
+    )
+    print(f"+ publish Rbt.Postgres {version} to {endpoint}", flush=True)
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            if response.status < 200 or response.status >= 300:
+                fail(f"publish returned HTTP {response.status}")
+    except urllib.error.HTTPError as error:
+        if error.code == 409:
+            print(f"Rbt.Postgres {version} is already published (409); no-op", flush=True)
+            return 0
+        detail = error.read(4096).decode("utf-8", errors="replace")
+        fail(f"publish failed with HTTP {error.code}: {detail}")
+    except (OSError, urllib.error.URLError) as error:
+        fail(f"publish failed: {error}")
+    print(f"published Rbt.Postgres {version}", flush=True)
+    return 0
+
+
+def publish_endpoint(source: str) -> str:
+    request = urllib.request.Request(source, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            index = json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        fail(f"could not read NuGet service index {source}: {error}")
+    for resource in index.get("resources", []):
+        resource_types = resource.get("@type", [])
+        if isinstance(resource_types, str):
+            resource_types = [resource_types]
+        if any(str(value).split("/", 1)[0] == "PackagePublish" for value in resource_types):
+            endpoint = str(resource.get("@id") or "").strip()
+            if endpoint:
+                return urllib.parse.urljoin(source, endpoint)
+    fail(f"NuGet service index has no PackagePublish resource: {source}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
