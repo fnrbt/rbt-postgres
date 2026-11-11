@@ -79,6 +79,7 @@ type PgInterval =
       Days: int
       Time: TimeSpan }
 
+
 /// A PostgreSQL range value (e.g. int4range, daterange). A None bound is
 /// unbounded (infinite); IsEmpty marks the empty range.
 type PgRange =
@@ -118,20 +119,53 @@ module Codecs =
         | _ -> Single.Parse(s, NumberStyles.Float, inv)
 
     let private byteaText (s: string) : byte[] =
-        if s.StartsWith("\\x") then Convert.FromHexString(s.Substring 2) else utf8.GetBytes s
+        if s.StartsWith("\\x", StringComparison.Ordinal) then Convert.FromHexString(s.Substring 2)
+        else
+            // The old bytea output format escapes \ as \\ and bytes as \ooo.
+            let bytes = ResizeArray<byte>(s.Length)
+            let mutable i = 0
+            while i < s.Length do
+                if s.[i] = '\\' then
+                    if i + 1 < s.Length && s.[i + 1] = '\\' then
+                        bytes.Add(byte '\\')
+                        i <- i + 2
+                    elif i + 3 < s.Length
+                         && s.[i + 1] >= '0' && s.[i + 1] <= '3'
+                         && s.[i + 2] >= '0' && s.[i + 2] <= '7'
+                         && s.[i + 3] >= '0' && s.[i + 3] <= '7' then
+                        let value = (int s.[i + 1] - 48) * 64 + (int s.[i + 2] - 48) * 8 + int s.[i + 3] - 48
+                        bytes.Add(byte value)
+                        i <- i + 4
+                    else
+                        invalidArg "s" "invalid bytea escape sequence"
+                elif int s.[i] <= 127 then
+                    bytes.Add(byte s.[i])
+                    i <- i + 1
+                else
+                    invalidArg "s" "non-ASCII byte in bytea escape representation"
+            bytes.ToArray()
 
-    let private microsToTimeOnly (micros: int64) = TimeOnly(micros * 10L)
+    let private ticksFromMicros (micros: int64) =
+        if micros > Int64.MaxValue / 10L || micros < Int64.MinValue / 10L then
+            raise (OverflowException("PostgreSQL microseconds exceed the .NET tick range"))
+        micros * 10L
+
+    let private microsToTime (micros: int64) =
+        if micros >= 0L && micros <= 86400000000L then TimeSpan.FromTicks(ticksFromMicros micros)
+        else raise (ArgumentOutOfRangeException("micros", "PostgreSQL time must be between 00:00:00 and 24:00:00"))
+
+    let private maxTimeTicks = TimeSpan.TicksPerDay
     let private daysToDate (days: int) = DateOnly(2000, 1, 1).AddDays(days)
 
     let private microsToTimestamp (micros: int64) =
         if micros = Int64.MaxValue then DateTime.MaxValue
         elif micros = Int64.MinValue then DateTime.MinValue
-        else pgEpoch.AddTicks(micros * 10L)
+        else pgEpoch.AddTicks(ticksFromMicros micros)
 
     let private microsToTimestamptz (micros: int64) =
         if micros = Int64.MaxValue then DateTimeOffset.MaxValue
         elif micros = Int64.MinValue then DateTimeOffset.MinValue
-        else pgEpochUtc.AddTicks(micros * 10L)
+        else pgEpochUtc.AddTicks(ticksFromMicros micros)
 
     // text/binary string codec (binary is just the UTF-8 bytes)
     let private stringCodec =
@@ -146,11 +180,34 @@ module Codecs =
 
     // ---- array (text format, generic over an element codec) ------------------
 
+    let private skipArrayDimensions (s: string) =
+        let mutable i = 0
+        while i < s.Length && s.[i] = '[' do
+            i <- i + 1
+            let lower = i
+            if i < s.Length && (s.[i] = '-' || s.[i] = '+') then i <- i + 1
+            while i < s.Length && Char.IsDigit s.[i] do i <- i + 1
+            if i = lower || (i = lower + 1 && (s.[lower] = '-' || s.[lower] = '+'))
+               || i >= s.Length || s.[i] <> ':' then
+                invalidArg "s" "invalid PostgreSQL array dimension"
+            i <- i + 1
+            let upper = i
+            if i < s.Length && (s.[i] = '-' || s.[i] = '+') then i <- i + 1
+            while i < s.Length && Char.IsDigit s.[i] do i <- i + 1
+            if i = upper || (i = upper + 1 && (s.[upper] = '-' || s.[upper] = '+'))
+               || i >= s.Length || s.[i] <> ']' then
+                invalidArg "s" "invalid PostgreSQL array dimension"
+            i <- i + 1
+        if i <> 0 then
+            if i >= s.Length || s.[i] <> '=' then invalidArg "s" "missing array dimensions separator"
+            i <- i + 1
+        i
+
     /// Recursively parse a PostgreSQL array literal into a (possibly nested,
     /// jagged) obj[]: "{1,2,3}" -> obj[]; "{{1,2},{3,4}}" -> obj[] of obj[].
     /// Elements are decoded with `decodeElem`; unquoted NULL becomes null.
     let private parseArrayText (decodeElem: string -> obj) (s: string) : obj =
-        let mutable i = 0
+        let mutable i = skipArrayDimensions s
         let n = s.Length
         let rec parseValue () : obj =
             if s.[i] = '{' then
@@ -183,7 +240,9 @@ module Codecs =
                     elif i < n && s.[i] = '}' then (i <- i + 1; go <- false)
                     else go <- false
             box (items.ToArray())
-        parseArray ()
+        let parsed = parseArray ()
+        if i <> n then invalidArg "s" "unexpected data after PostgreSQL array"
+        parsed
 
     let private arrayCodec (elementDecodeText: string -> obj) =
         { PreferBinary = false
@@ -224,10 +283,51 @@ module Codecs =
     let private dOid (s: string) = box (UInt32.Parse(s, inv))
     let private dFloat4 (s: string) = box (parseSingle s)
     let private dFloat8 (s: string) = box (parseFloat s)
-    let private dNumeric (s: string) = box (Decimal.Parse(s, NumberStyles.Float, inv))
+    // Decimal.Parse rounds excess fractional digits. Compare normalized base-10
+    // coefficients and powers so any nonrepresentable value fails explicitly.
+    let private decimalComponents (s: string) =
+        let mantissa, exponent =
+            let lower = s.IndexOf('e')
+            let e = if lower < 0 then s.IndexOf('E') else lower
+            if e < 0 then s, 0
+            else s.Substring(0, e), Int32.Parse(s.Substring(e + 1), NumberStyles.AllowLeadingSign, inv)
+        let digits = StringBuilder(mantissa.Length)
+        let mutable fractional = 0
+        let mutable afterPoint = false
+        for c in mantissa do
+            if c = '.' then afterPoint <- true
+            elif c >= '0' && c <= '9' then
+                digits.Append(c) |> ignore
+                if afterPoint then fractional <- fractional + 1
+        let all = digits.ToString()
+        let significant = all.TrimStart('0')
+        if significant.Length = 0 then "", 0
+        else
+            let trimmed = significant.TrimEnd('0')
+            trimmed, exponent - fractional + significant.Length - trimmed.Length
+
+    let private parseExactDecimal (s: string) =
+        let parsed = Decimal.Parse(s, NumberStyles.Float, inv)
+        if decimalComponents s <> decimalComponents (parsed.ToString(inv)) then
+            raise (OverflowException("PostgreSQL numeric cannot be represented exactly as System.Decimal"))
+        parsed
+
+    let private parsePgTime (s: string) =
+        if s.StartsWith("24:00:00", StringComparison.Ordinal) then
+            if s.Length = 8
+               || (s.Length > 9 && s.[8] = '.' && s.AsSpan(9).IndexOfAnyExcept('0') < 0) then
+                TimeSpan.FromTicks(maxTimeTicks)
+            else invalidArg "s" "PostgreSQL time must be between 00:00:00 and 24:00:00"
+        else
+            let time = TimeSpan.Parse(s, inv)
+            if time < TimeSpan.Zero || time.Ticks > maxTimeTicks then
+                invalidArg "s" "PostgreSQL time must be between 00:00:00 and 24:00:00"
+            time
+
+    let private dNumeric (s: string) = box (parseExactDecimal s)
     let private dUuid (s: string) = box (Guid.Parse s)
     let private dDate (s: string) = box (DateOnly.ParseExact(s, "yyyy-MM-dd", inv))
-    let private dTime (s: string) = box (TimeOnly.Parse(s, inv))
+    let private dTime (s: string) = box (parsePgTime s)
     let private dTimestamp (s: string) = box (DateTime.Parse(s, inv, DateTimeStyles.None))
     let private dTimestamptz (s: string) = box (DateTimeOffset.Parse(s, inv))
     let private dString (s: string) = box s
@@ -243,7 +343,7 @@ module Codecs =
     let private bFloat8 (b: byte[]) = box (BinaryPrimitives.ReadDoubleBigEndian(span b))
     let private bUuid (b: byte[]) = box (Guid(span b, bigEndian = true))
     let private bDate (b: byte[]) = box (daysToDate (BinaryPrimitives.ReadInt32BigEndian(span b)))
-    let private bTime (b: byte[]) = box (microsToTimeOnly (BinaryPrimitives.ReadInt64BigEndian(span b)))
+    let private bTime (b: byte[]) = box (microsToTime (BinaryPrimitives.ReadInt64BigEndian(span b)))
     let private bTimestamp (b: byte[]) = box (microsToTimestamp (BinaryPrimitives.ReadInt64BigEndian(span b)))
     let private bTimestamptz (b: byte[]) = box (microsToTimestamptz (BinaryPrimitives.ReadInt64BigEndian(span b)))
 
@@ -252,7 +352,7 @@ module Codecs =
         let micros = BinaryPrimitives.ReadInt64BigEndian(ReadOnlySpan<byte>(b, 0, 8))
         let days = BinaryPrimitives.ReadInt32BigEndian(ReadOnlySpan<byte>(b, 8, 4))
         let months = BinaryPrimitives.ReadInt32BigEndian(ReadOnlySpan<byte>(b, 12, 4))
-        box { Months = months; Days = days; Time = TimeSpan.FromTicks(micros * 10L) }
+        box { Months = months; Days = days; Time = TimeSpan.FromTicks(ticksFromMicros micros) }
 
     // ---- registry ------------------------------------------------------------
 
@@ -266,7 +366,7 @@ module Codecs =
           Oids.oid, scalar true dOid bOid
           Oids.float4, scalar true dFloat4 bFloat4
           Oids.float8, scalar true dFloat8 bFloat8
-          Oids.numeric, scalar false dNumeric box // text: lossless decimal
+          Oids.numeric, scalar false dNumeric box // text: exact decimal or explicit overflow
           Oids.uuid, scalar true dUuid bUuid
           Oids.date, scalar true dDate bDate
           Oids.time, scalar true dTime bTime
@@ -368,18 +468,52 @@ module Codecs =
     let private guidBE (g: Guid) = let b = Array.zeroCreate 16 in g.TryWriteBytes(Span(b), bigEndian = true) |> ignore; b
     let private epochDay = DateOnly(2000, 1, 1).DayNumber
 
+    let private validTimeTicks (ticks: int64) =
+        if ticks < 0L || ticks > maxTimeTicks || ticks % 10L <> 0L then
+            invalidArg "v" "PostgreSQL time must be between 00:00:00 and 24:00:00 at microsecond precision"
+        ticks
+
+    let private timeTicks (v: obj) =
+        match v with
+        | :? TimeSpan as t -> validTimeTicks t.Ticks
+        | :? TimeOnly as t -> validTimeTicks t.Ticks
+        | _ -> invalidArg "v" "expected TimeSpan or TimeOnly"
+
+    let private formatTime (ticks: int64) =
+        if ticks = maxTimeTicks then "24:00:00"
+        else
+            let time = TimeSpan.FromTicks(ticks)
+            if ticks % TimeSpan.TicksPerSecond = 0L then time.ToString("hh\\:mm\\:ss", inv)
+            else time.ToString("hh\\:mm\\:ss\\.ffffff", inv).TrimEnd('0')
+
+    let private encodeTimeArray (enc: Encoding) (value: Array) =
+        let text = StringBuilder()
+        let rec append (v: obj) =
+            match v with
+            | null -> text.Append("NULL") |> ignore
+            | :? Array as items ->
+                if items.Rank <> 1 then invalidArg "value" "time arrays must be one-dimensional or nested arrays"
+                text.Append('{') |> ignore
+                for i = 0 to items.Length - 1 do
+                    if i <> 0 then text.Append(',') |> ignore
+                    append (items.GetValue(i))
+                text.Append('}') |> ignore
+            | _ -> text.Append(formatTime (timeTicks v)) |> ignore
+        append value
+        enc.GetBytes(text.ToString())
+
     let private binEncoders : Map<int, obj -> byte[]> =
-        [ Oids.bool, (fun (v: obj) -> [| (if Convert.ToBoolean v then 1uy else 0uy) |])
-          Oids.int2, (fun (v: obj) -> beInt16 (Convert.ToInt16 v))
-          Oids.int4, (fun (v: obj) -> beInt32 (Convert.ToInt32 v))
-          Oids.int8, (fun (v: obj) -> beInt64 (Convert.ToInt64 v))
-          Oids.oid, (fun (v: obj) -> beUInt32 (Convert.ToUInt32 v))
-          Oids.float4, (fun (v: obj) -> beSingle (Convert.ToSingle v))
-          Oids.float8, (fun (v: obj) -> beDouble (Convert.ToDouble v))
+        [ Oids.bool, (fun (v: obj) -> [| (if Convert.ToBoolean(v, inv) then 1uy else 0uy) |])
+          Oids.int2, (fun (v: obj) -> beInt16 (Convert.ToInt16(v, inv)))
+          Oids.int4, (fun (v: obj) -> beInt32 (Convert.ToInt32(v, inv)))
+          Oids.int8, (fun (v: obj) -> beInt64 (Convert.ToInt64(v, inv)))
+          Oids.oid, (fun (v: obj) -> beUInt32 (Convert.ToUInt32(v, inv)))
+          Oids.float4, (fun (v: obj) -> beSingle (Convert.ToSingle(v, inv)))
+          Oids.float8, (fun (v: obj) -> beDouble (Convert.ToDouble(v, inv)))
           Oids.bytea, (fun (v: obj) -> v :?> byte[])
           Oids.uuid, (fun (v: obj) -> guidBE (v :?> Guid))
           Oids.date, (fun (v: obj) -> beInt32 ((v :?> DateOnly).DayNumber - epochDay))
-          Oids.time, (fun (v: obj) -> beInt64 ((v :?> TimeOnly).Ticks / 10L))
+          Oids.time, (fun (v: obj) -> beInt64 (timeTicks v / 10L))
           Oids.timestamp, (fun (v: obj) -> beInt64 (((v :?> DateTime) - pgEpoch).Ticks / 10L))
           Oids.timestamptz, (fun (v: obj) -> beInt64 (((v :?> DateTimeOffset).UtcDateTime - pgEpoch).Ticks / 10L)) ]
         |> Map.ofList
@@ -402,6 +536,8 @@ module Codecs =
             | :? Guid as g -> g.ToString("D")
             | :? (byte[]) as bytes -> "\\x" + Convert.ToHexString(bytes)
             | :? DateOnly as d -> d.ToString("yyyy-MM-dd", inv)
+            | :? TimeSpan as t when t >= TimeSpan.Zero && t.Ticks <= maxTimeTicks ->
+                formatTime t.Ticks
             | :? TimeOnly as t -> t.ToString("HH:mm:ss.FFFFFF", inv)
             | :? DateTime as dt -> dt.ToString("yyyy-MM-dd HH:mm:ss.FFFFFF", inv)
             | :? DateTimeOffset as dto -> dto.ToString("yyyy-MM-dd HH:mm:ss.FFFFFFzzz", inv)
@@ -413,8 +549,15 @@ module Codecs =
     /// (format code, bytes). Binary encoding that fails (type mismatch) also
     /// falls back to text.
     let encodeParam (enc: Encoding) (oid: int) (v: obj) : int * byte[] =
-        match Map.tryFind oid binEncoders with
-        | Some e ->
-            try 1, e v
-            with _ -> 0, encodeParamText enc v
-        | None -> 0, encodeParamText enc v
+        // Validate typed time inputs before binary's mismatch-to-text fallback.
+        if oid = Oids.time then
+            match v with
+            | :? TimeSpan | :? TimeOnly -> timeTicks v |> ignore
+            | _ -> ()
+        if oid = Oids.timeArray && v :? Array then 0, encodeTimeArray enc (v :?> Array)
+        else
+            match Map.tryFind oid binEncoders with
+            | Some e ->
+                try 1, e v
+                with _ -> 0, encodeParamText enc v
+            | None -> 0, encodeParamText enc v

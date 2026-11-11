@@ -21,6 +21,10 @@
     <Compile Include="Phase11Tests.fs" />
     <Compile Include="Phase12Tests.fs" />
     <Compile Include="Phase13Tests.fs" />
+    <Compile Include="WireRegressionTests.fs" />
+    <Compile Include="CodecRegressionTests.fs" />
+    <Compile Include="SecurityRegressionTests.fs" />
+    <Compile Include="ConnectionRegressionTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

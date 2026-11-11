@@ -7,8 +7,14 @@ open Rbt.Postgres.Wire
 /// payload from a pgoutput slot is one of these messages.
 module PgOutput =
 
-    /// A decoded tuple: per-column text value, None for NULL / unchanged-TOAST.
-    type Tuple = string option []
+    /// A tuple column, preserving PostgreSQL's distinct wire representations.
+    type Value =
+        | Null
+        | UnchangedToast
+        | Text of string
+        | Binary of byte[]
+
+    type Tuple = Value[]
 
     type Message =
         | Begin of finalLsn: int64 * xid: int
@@ -23,14 +29,14 @@ module PgOutput =
         | Other of tag: char
 
     let private parseTuple (m: IncomingMessage) : Tuple =
-        let n = m.Int16()
+        let n = m.UInt16()
         Array.init n (fun _ ->
             match char (m.Byte()) with
-            | 'n' | 'u' -> None // null / unchanged TOAST
-            | 't' | 'b' ->
-                let len = m.Int32()
-                Some(utf8.GetString(m.Bytes len))
-            | _ -> None)
+            | 'n' -> Null
+            | 'u' -> UnchangedToast
+            | 't' -> Text(utf8.GetString(m.Bytes(m.Int32())))
+            | 'b' -> Binary(m.Bytes(m.Int32()))
+            | tag -> failwithf "Unknown pgoutput tuple value '%c'." tag)
 
     /// Parse one pgoutput message from an XLogData payload.
     let parse (payload: byte[]) : Message =
@@ -52,7 +58,7 @@ module PgOutput =
             let schema = m.CString()
             let name = m.CString()
             m.Byte() |> ignore // replica identity
-            let ncol = m.Int16()
+            let ncol = m.UInt16()
             let cols =
                 Array.init ncol (fun _ ->
                     m.Byte() |> ignore // flags
@@ -131,6 +137,9 @@ module Replication =
 
     /// Stream a logical slot from the given LSN ("0/0" = slot's restart point),
     /// invoking `onChange` with each decoded payload; return false to stop.
+    /// After durable flush and application, explicitly call
+    /// `conn.AcknowledgeReplication` with the processed LSN. Server walEnd
+    /// is not necessarily a processed LSN. Without acknowledgement, zero is sent.
     let streamLogical
         (conn: Connection)
         (slot: string)

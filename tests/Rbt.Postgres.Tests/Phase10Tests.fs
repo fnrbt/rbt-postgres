@@ -104,8 +104,8 @@ type Phase10Tests(fixture: PostgresFixture) =
             let inserts =
                 msgs |> Seq.choose (function PgOutput.Insert(_, t) -> Some t | _ -> None) |> Seq.toList
             Assert.True(inserts.Length >= 2)
-            Assert.Equal(Some "1", inserts.[0].[0])
-            Assert.Equal(Some "alice", inserts.[0].[1])
+            Assert.Equal(PgOutput.Text "1", inserts.[0].[0])
+            Assert.Equal(PgOutput.Text "alice", inserts.[0].[1])
             // UPDATE + DELETE were observed
             Assert.True(msgs |> Seq.exists (function PgOutput.Update _ -> true | _ -> false))
             Assert.True(msgs |> Seq.exists (function PgOutput.Delete _ -> true | _ -> false))

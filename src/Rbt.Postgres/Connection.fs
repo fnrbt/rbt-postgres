@@ -82,7 +82,8 @@ type PgRowStream
      parameters: obj option list,
      batchSize: int,
      encoding: System.Text.Encoding,
-     onNotice: PostgresErrorFields -> unit,
+     onAsyncMessage: IncomingMessage -> bool,
+     invalidate: unit -> unit,
      ct: CancellationToken) =
 
     let decodeRow (pgcols: PgColumn[]) (m: IncomingMessage) =
@@ -93,15 +94,18 @@ type PgRowStream
                 cell |> Option.map (fun bytes -> Codecs.decode encoding pgcols.[i].TypeOid pgcols.[i].Format bytes))
         PgRow(pgcols, vals)
 
-    member private _.DrainToReady() : Task =
+    member private _.DrainToReady(token: CancellationToken) : Task =
         task {
             let mutable z = false
             while not z do
-                let! m = transport.ReadMessageAsync(ct)
+                let! m = transport.ReadMessageAsync(token)
                 if m.Tag = 'Z' then z <- true
+                else onAsyncMessage m |> ignore
         }
 
-    member this.GetEnumerator() : IAsyncEnumerator<PgRow> =
+    member this.GetEnumerator(enumeratorToken: CancellationToken) : IAsyncEnumerator<PgRow> =
+        let linked = CancellationTokenSource.CreateLinkedTokenSource(ct, enumeratorToken)
+        let ct = linked.Token
         let buffer = Queue<PgRow>()
         let mutable pgcols : PgColumn[] = [||]
         let mutable initialized = false
@@ -111,7 +115,7 @@ type PgRowStream
         let raiseError (e: PostgresErrorFields) : Task =
             task {
                 do! transport.SendAsync(sync (), ct)
-                do! this.DrainToReady()
+                do! this.DrainToReady(ct)
                 raise (PostgresException e)
             }
 
@@ -133,6 +137,7 @@ type PgRowStream
                     | 'T' -> columns <- parseRowDescription m; describing <- false
                     | 'n' -> columns <- [||]; describing <- false
                     | 'E' -> do! raiseError (ErrorFields.parse m)
+                    | _ when onAsyncMessage m -> ()
                     | other -> failwithf "Unexpected '%c' during stream Describe." other
                 let formats = columns |> Array.map (fun c -> if Codecs.hasBinary c.TypeOid then 1 else 0)
                 pgcols <- columns |> Array.mapi (fun i c -> { Name = c.Name; TypeOid = c.TypeOid; Format = formats.[i] })
@@ -142,11 +147,14 @@ type PgRowStream
                 transport.Enqueue(bindParams "" "" paramData formats)
                 transport.Enqueue(flush ())
                 do! transport.FlushAsync(ct)
-                let! bc = transport.ReadMessageAsync(ct)
-                match bc.Tag with
-                | '2' -> ()
-                | 'E' -> do! raiseError (ErrorFields.parse bc)
-                | other -> failwithf "Unexpected '%c' after stream Bind." other
+                let mutable bound = false
+                while not bound do
+                    let! bc = transport.ReadMessageAsync(ct)
+                    match bc.Tag with
+                    | '2' -> bound <- true
+                    | 'E' -> do! raiseError (ErrorFields.parse bc)
+                    | _ when onAsyncMessage bc -> ()
+                    | other -> failwithf "Unexpected '%c' after stream Bind." other
             }
 
         // Fetch the next batch; on CommandComplete close out with Sync.
@@ -166,9 +174,9 @@ type PgRowStream
                         portalDone <- true
                         batching <- false
                         do! transport.SendAsync(sync (), ct)
-                        do! this.DrainToReady()
-                    | 'N' -> onNotice (ErrorFields.parse m)
+                        do! this.DrainToReady(ct)
                     | 'E' -> batching <- false; do! raiseError (ErrorFields.parse m)
+                    | _ when onAsyncMessage m -> ()
                     | other -> failwithf "Unexpected '%c' while streaming rows." other
             }
 
@@ -178,16 +186,22 @@ type PgRowStream
             member _.MoveNextAsync() : ValueTask<bool> =
                 ValueTask<bool>(
                     task {
-                        if not initialized then
-                            do! initAsync ()
-                            initialized <- true
-                        if buffer.Count = 0 && not portalDone then
-                            do! pullBatchAsync ()
-                        if buffer.Count > 0 then
-                            current <- buffer.Dequeue()
-                            return true
-                        else
-                            return false
+                        try
+                            ct.ThrowIfCancellationRequested()
+                            if not initialized then
+                                do! initAsync ()
+                                initialized <- true
+                            if buffer.Count = 0 && not portalDone then
+                                do! pullBatchAsync ()
+                            ct.ThrowIfCancellationRequested()
+                            if buffer.Count > 0 then
+                                current <- buffer.Dequeue()
+                                return true
+                            else
+                                return false
+                        with ex ->
+                            invalidate ()
+                            return raise ex
                     })
 
             member _.DisposeAsync() : ValueTask =
@@ -195,15 +209,17 @@ type PgRowStream
                     task {
                         // If the consumer abandoned the stream early, close the
                         // portal and return the connection to a clean state.
-                        if initialized && not portalDone then
-                            try
-                                do! transport.SendAsync(sync (), ct)
-                                do! this.DrainToReady()
-                            with _ -> ()
+                        try
+                            if initialized && not portalDone then
+                                use cleanup = new CancellationTokenSource(TimeSpan.FromSeconds 5.0)
+                                do! transport.SendAsync(sync (), cleanup.Token)
+                                do! this.DrainToReady(cleanup.Token)
+                        with _ -> invalidate ()
+                        linked.Dispose()
                     }) }
 
     interface IAsyncEnumerable<PgRow> with
-        member this.GetAsyncEnumerator(_: CancellationToken) = this.GetEnumerator()
+        member this.GetAsyncEnumerator(token: CancellationToken) = this.GetEnumerator(token)
 
 /// A live connection to a PostgreSQL server.
 type Connection(config: ConnConfig) =
@@ -220,16 +236,31 @@ type Connection(config: ConnConfig) =
     let notifyEvent = Event<Notification>()
     let noticeEvent = Event<PostgresErrorFields>()
     let mutable dataEncoding : System.Text.Encoding = utf8 // resolved from client_encoding
+    let mutable replicationAcknowledged = 0L
+
+    let invalidate () =
+        if not (isNull socket) then
+            socket.Dispose()
+            socket <- null
 
     let applyParameterStatus (k: string) (v: string) =
         parameters.[k] <- v
-        if k = "client_encoding" then dataEncoding <- PgEncoding.resolve v
+        if k = "client_encoding" then
+            dataEncoding <- PgEncoding.resolve v
+            if not (isNull (box transport)) then transport.Encoding <- dataEncoding
 
     let recordNotification (m: IncomingMessage) =
         let pid, ch, payload = parseNotification m
         let n = { Pid = pid; Channel = ch; Payload = payload }
         notifications.Enqueue n
         notifyEvent.Trigger n
+
+    let handleAsyncMessage (m: IncomingMessage) =
+        match m.Tag with
+        | 'S' -> applyParameterStatus (m.CString()) (m.CString()); true
+        | 'A' -> recordNotification m; true
+        | 'N' -> noticeEvent.Trigger(ErrorFields.parse m); true
+        | _ -> false
 
     member _.Config = config
     member _.ServerParameters = parameters
@@ -263,8 +294,7 @@ type Connection(config: ConnConfig) =
     member val SslRootCert : string option = None with get, set
     member val SslClientCertificate :
         System.Security.Cryptography.X509Certificates.X509Certificate2 option = None with get, set
-    /// The client_encoding requested at startup (default UTF8). Note: value
-    /// decoding currently assumes UTF-8 regardless of this setting.
+    /// The client_encoding requested at startup (default UTF8).
     member val ClientEncoding = "UTF8" with get, set
     /// Set to Some "database" (logical) or Some "true" (physical) to open a
     /// replication connection.
@@ -377,11 +407,8 @@ type Connection(config: ConnConfig) =
 
     // ---- Connect -------------------------------------------------------------
 
-    member this.OpenAsync(?cancellationToken: CancellationToken) : Task =
+    member private this.OpenAttemptAsync(mode: SslMode, tok: CancellationToken) : Task =
         task {
-            let ct = defaultArg cancellationToken CancellationToken.None
-            use cts = ConnUtil.linked ct this.ConnectTimeout
-            let tok = cts.Token
             match config.Endpoint with
             | Tcp(host, port) ->
                 socket <- new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
@@ -400,7 +427,7 @@ type Connection(config: ConnConfig) =
                 | Tcp(h, _) -> h
                 | Unix _ -> "localhost"
             let sslCfg =
-                { Mode = this.SslMode
+                { Mode = mode
                   RootCertPath = this.SslRootCert
                   ClientCertificate = this.SslClientCertificate
                   TargetHost = host }
@@ -421,6 +448,25 @@ type Connection(config: ConnConfig) =
             do! transport.SendAsync(startupMessage startupParams, tok)
             do! this.AuthenticateAsync(tok)
             do! this.ReadStartupTailAsync(tok)
+        }
+
+    member this.OpenAsync(?cancellationToken: CancellationToken) : Task =
+        task {
+            let ct = defaultArg cancellationToken CancellationToken.None
+            use cts = ConnUtil.linked ct this.ConnectTimeout
+            try
+                try
+                    do! this.OpenAttemptAsync(this.SslMode, cts.Token)
+                with
+                | :? PostgresException as ex
+                    when this.SslMode = Allow && ex.SqlState = "28000" ->
+                    invalidate ()
+                    if not (isNull (box transport)) then transport.Dispose()
+                    transport <- Unchecked.defaultof<Transport>
+                    do! this.OpenAttemptAsync(Require, cts.Token)
+            with ex ->
+                invalidate ()
+                return raise ex
         }
 
     member this.Open() = this.OpenAsync().GetAwaiter().GetResult()
@@ -481,6 +527,7 @@ type Connection(config: ConnConfig) =
         : Task<'T> =
         task {
             use cts = ConnUtil.linked userCt timeout
+            userCt.ThrowIfCancellationRequested()
             let mutable cancelSent = 0
             use _reg =
                 cts.Token.Register(fun () ->
@@ -493,9 +540,14 @@ type Connection(config: ConnConfig) =
                 if userCt.IsCancellationRequested then return raise (OperationCanceledException userCt)
                 elif cts.IsCancellationRequested then return raise (TimeoutException "Command timed out.")
                 else return result
-            with :? PostgresException as ex when ex.SqlState = "57014" && cts.IsCancellationRequested ->
+            with
+            | :? PostgresException as ex when ex.SqlState = "57014" && cts.IsCancellationRequested ->
                 if userCt.IsCancellationRequested then return raise (OperationCanceledException userCt)
                 else return raise (TimeoutException "Command timed out.")
+            | :? PostgresException as ex -> return raise ex
+            | ex ->
+                invalidate ()
+                return raise ex
         }
 
     // ---- Simple query protocol ----------------------------------------------
@@ -523,7 +575,7 @@ type Connection(config: ConnConfig) =
             (fun tok ->
                 task {
                     transport.Enqueue(parse dataEncoding "" sql [])
-                    transport.Enqueue(bind "" "" parameters)
+                    transport.Enqueue(bind dataEncoding "" "" parameters)
                     transport.Enqueue(describePortal "")
                     transport.Enqueue(execute "" 0)
                     transport.Enqueue(sync ())
@@ -556,7 +608,7 @@ type Connection(config: ConnConfig) =
             (fun tok ->
                 task {
                     transport.Enqueue(parse dataEncoding "" sql [])
-                    transport.Enqueue(bind "" "" parameters)
+                    transport.Enqueue(bind dataEncoding "" "" parameters)
                     transport.Enqueue(describePortal "")
                     // One row past the limit: the server suspends a portal
                     // whenever it reaches the limit, rows left or not, so only
@@ -585,6 +637,7 @@ type Connection(config: ConnConfig) =
     /// Run a (optionally parameterized) statement and decode each column to its
     /// natural .NET type. Columns whose type has a binary codec are requested in
     /// binary; the rest in text. Parameters are sent in text format.
+    /// A local encoding or decoding failure invalidates the connection.
     member this.QueryTypedAsync
         (sql: string, ?parameters: obj option list, ?cancellationToken: CancellationToken)
         : Task<TypedResult> =
@@ -618,6 +671,7 @@ type Connection(config: ConnConfig) =
                 | 'E' ->
                     describeErr <- Some(ErrorFields.parse m)
                     describing <- false
+                | _ when handleAsyncMessage m -> ()
                 | other -> failwithf "Unexpected message '%c' during Describe." other
 
             match describeErr with
@@ -628,6 +682,7 @@ type Connection(config: ConnConfig) =
                 while not z do
                     let! m = transport.ReadMessageAsync(tok)
                     if m.Tag = 'Z' then z <- true
+                    else handleAsyncMessage m |> ignore
                 raise (PostgresException e)
             | None -> ()
 
@@ -663,7 +718,7 @@ type Connection(config: ConnConfig) =
                     rows.Add(PgRow(pgcols, vals))
                 | 'C' -> tag <- m.CString()
                 | 's' -> () // PortalSuspended (not used here)
-                | 'N' -> noticeEvent.Trigger(ErrorFields.parse m)
+                | _ when handleAsyncMessage m -> ()
                 | 'E' -> err <- Some(ErrorFields.parse m)
                 | 'Z' -> ready <- true
                 | other -> failwithf "Unexpected message '%c' while reading typed rows." other
@@ -699,8 +754,7 @@ type Connection(config: ConnConfig) =
                     rows.Add(PgRow(pgcols, vals))
                 | 'C' -> tag <- m.CString()
                 | 's' -> ()
-                | 'A' -> recordNotification m
-                | 'N' -> noticeEvent.Trigger(ErrorFields.parse m)
+                | _ when handleAsyncMessage m -> ()
                 | 'E' -> err <- Some(ErrorFields.parse m)
                 | 'Z' -> ready <- true
                 | other -> failwithf "Unexpected message '%c' reading rows." other
@@ -711,9 +765,8 @@ type Connection(config: ConnConfig) =
 
     /// Parse and Describe a named statement on the server, returning its
     /// parameter OIDs and result column metadata. The name is reusable.
-    member this.PrepareAsync(sql: string, ?name: string, ?cancellationToken: CancellationToken) : Task<PreparedStatement> =
+    member private this.PrepareCoreAsync(sql: string, name: string option, ct: CancellationToken) : Task<PreparedStatement> =
         task {
-            let ct = defaultArg cancellationToken CancellationToken.None
             use cts = ConnUtil.linked ct this.CommandTimeout
             let tok = cts.Token
             let stmtName =
@@ -737,6 +790,7 @@ type Connection(config: ConnConfig) =
                 | 't' -> paramOids <- parseParameterDescription m
                 | 'T' -> columns <- parseRowDescription m
                 | 'n' -> columns <- [||]
+                | _ when handleAsyncMessage m -> ()
                 | 'E' -> err <- Some(ErrorFields.parse m)
                 | 'Z' -> ready <- true
                 | other -> failwithf "Unexpected message '%c' during Prepare." other
@@ -745,6 +799,15 @@ type Connection(config: ConnConfig) =
             | None ->
                 stmtCache.[sql] <- stmtName
                 return { Name = stmtName; Sql = sql; ParameterOids = paramOids; Columns = columns }
+        }
+
+    member this.PrepareAsync(sql: string, ?name: string, ?cancellationToken: CancellationToken) : Task<PreparedStatement> =
+        task {
+            try
+                return! this.PrepareCoreAsync(sql, name, defaultArg cancellationToken CancellationToken.None)
+            with
+            | :? PostgresException as ex -> return raise ex
+            | ex -> invalidate (); return raise ex
         }
 
     member this.Prepare(sql: string) = this.PrepareAsync(sql).GetAwaiter().GetResult()
@@ -778,27 +841,39 @@ type Connection(config: ConnConfig) =
         this.ExecutePreparedAsync(stmt, parameters).GetAwaiter().GetResult()
 
     /// Close a named prepared statement on the server.
-    member this.CloseStatementAsync(name: string, ?cancellationToken: CancellationToken) : Task =
+    member private this.CloseStatementCoreAsync(name: string, ct: CancellationToken) : Task =
         task {
-            let ct = defaultArg cancellationToken CancellationToken.None
             use cts = ConnUtil.linked ct this.CommandTimeout
             let tok = cts.Token
             transport.Enqueue(closeStatement name)
             transport.Enqueue(sync ())
             do! transport.FlushAsync(tok)
             let mutable ready = false
+            let mutable err : PostgresErrorFields option = None
             while not ready do
                 let! m = transport.ReadMessageAsync(tok)
                 match m.Tag with
                 | '3' -> () // CloseComplete
                 | 'Z' -> ready <- true
-                | 'E' -> raise (PostgresException(ErrorFields.parse m))
-                | _ -> ()
+                | 'E' -> err <- Some(ErrorFields.parse m)
+                | _ -> handleAsyncMessage m |> ignore
             stmtCache
             |> Seq.filter (fun kv -> kv.Value = name)
             |> Seq.map (fun kv -> kv.Key)
             |> Seq.toList
             |> List.iter (fun k -> stmtCache.Remove k |> ignore)
+            match err with
+            | Some e -> raise (PostgresException e)
+            | None -> ()
+        }
+
+    member this.CloseStatementAsync(name: string, ?cancellationToken: CancellationToken) : Task =
+        task {
+            try
+                do! this.CloseStatementCoreAsync(name, defaultArg cancellationToken CancellationToken.None)
+            with
+            | :? PostgresException as ex -> return raise ex
+            | ex -> invalidate (); return raise ex
         }
 
     member this.CloseStatement(name: string) =
@@ -815,7 +890,7 @@ type Connection(config: ConnConfig) =
         let ps = defaultArg parameters []
         let bs = defaultArg batchSize 100
         let ct = defaultArg cancellationToken CancellationToken.None
-        PgRowStream(transport, sql, ps, bs, dataEncoding, noticeEvent.Trigger, ct) :> IAsyncEnumerable<PgRow>
+        PgRowStream(transport, sql, ps, bs, dataEncoding, handleAsyncMessage, invalidate, ct) :> IAsyncEnumerable<PgRow>
 
     // ---- COPY protocol -------------------------------------------------------
 
@@ -825,14 +900,16 @@ type Connection(config: ConnConfig) =
             while not z do
                 let! m = transport.ReadMessageAsync(tok)
                 if m.Tag = 'Z' then z <- true
+                else handleAsyncMessage m |> ignore
         }
 
     /// COPY ... FROM STDIN: stream the given CopyData chunks to the server.
     /// `copySql` is e.g. "COPY t (a,b) FROM STDIN" (text) or "... WITH (FORMAT binary)".
     /// Returns the number of rows copied.
-    member this.CopyInRawAsync(copySql: string, chunks: seq<byte[]>, ?cancellationToken: CancellationToken) : Task<int> =
+    /// If enumeration or local I/O fails after COPY starts, the connection is invalidated.
+    member private this.CopyInRawCoreAsync(copySql: string, chunks: seq<byte[]>, cancellationToken: CancellationToken) : Task<int> =
         task {
-            let ct = defaultArg cancellationToken CancellationToken.None
+            let ct = cancellationToken
             use cts = ConnUtil.linked ct this.CommandTimeout
             let tok = cts.Token
             do! transport.SendAsync(query dataEncoding copySql, tok)
@@ -844,7 +921,7 @@ type Connection(config: ConnConfig) =
                 let! m = transport.ReadMessageAsync(tok)
                 match m.Tag with
                 | 'G' -> starting <- false
-                | 'N' -> ()
+                | _ when handleAsyncMessage m -> ()
                 | 'E' ->
                     startErr <- Some(ErrorFields.parse m)
                     do! this.DrainToReadyAsync(tok)
@@ -854,8 +931,12 @@ type Connection(config: ConnConfig) =
             match startErr with
             | Some e -> return raise (PostgresException e)
             | None ->
-                for chunk in chunks do
-                    transport.Enqueue(copyData chunk)
+                try
+                    for chunk in chunks do
+                        do! transport.SendAsync(copyData chunk, tok)
+                with ex ->
+                    invalidate ()
+                    raise ex
                 transport.Enqueue(copyDone ())
                 do! transport.FlushAsync(tok)
 
@@ -866,7 +947,7 @@ type Connection(config: ConnConfig) =
                     let! m = transport.ReadMessageAsync(tok)
                     match m.Tag with
                     | 'C' -> tag <- m.CString()
-                    | 'N' -> ()
+                    | _ when handleAsyncMessage m -> ()
                     | 'E' -> err <- Some(ErrorFields.parse m)
                     | 'Z' -> ready <- true
                     | _ -> ()
@@ -875,18 +956,28 @@ type Connection(config: ConnConfig) =
                 | None -> return copyCount tag
         }
 
+    /// Stream COPY FROM STDIN chunks. A local input or I/O failure invalidates
+    /// the connection; the producer must not assume partially sent rows committed.
+    member this.CopyInRawAsync(copySql: string, chunks: seq<byte[]>, ?cancellationToken: CancellationToken) : Task<int> =
+        task {
+            try
+                return! this.CopyInRawCoreAsync(copySql, chunks, defaultArg cancellationToken CancellationToken.None)
+            with
+            | :? PostgresException as ex -> return raise ex
+            | ex -> invalidate (); return raise ex
+        }
+
     /// COPY ... FROM STDIN with one text row per line.
     member this.CopyInTextAsync(copySql: string, rows: seq<string>, ?cancellationToken: CancellationToken) : Task<int> =
-        let chunks = rows |> Seq.map (fun r -> utf8.GetBytes(r + "\n"))
+        let chunks = rows |> Seq.map (fun r -> dataEncoding.GetBytes(r + "\n"))
         this.CopyInRawAsync(copySql, chunks, ?cancellationToken = cancellationToken)
 
     member this.CopyInText(copySql: string, rows: seq<string>) =
         this.CopyInTextAsync(copySql, rows).GetAwaiter().GetResult()
 
     /// COPY ... TO STDOUT: collect the raw CopyData chunks the server sends.
-    member this.CopyOutRawAsync(copySql: string, ?cancellationToken: CancellationToken) : Task<byte[] list> =
+    member private this.CopyOutRawCoreAsync(copySql: string, ct: CancellationToken) : Task<byte[] list> =
         task {
-            let ct = defaultArg cancellationToken CancellationToken.None
             use cts = ConnUtil.linked ct this.CommandTimeout
             let tok = cts.Token
             do! transport.SendAsync(query dataEncoding copySql, tok)
@@ -900,7 +991,7 @@ type Connection(config: ConnConfig) =
                 | 'd' -> chunks.Add(m.Body) // CopyData
                 | 'c' -> () // CopyDone
                 | 'C' -> m.CString() |> ignore // CommandComplete
-                | 'N' -> ()
+                | _ when handleAsyncMessage m -> ()
                 | 'E' -> err <- Some(ErrorFields.parse m)
                 | 'Z' -> ready <- true
                 | _ -> ()
@@ -909,11 +1000,20 @@ type Connection(config: ConnConfig) =
             | None -> return List.ofSeq chunks
         }
 
+    member this.CopyOutRawAsync(copySql: string, ?cancellationToken: CancellationToken) : Task<byte[] list> =
+        task {
+            try
+                return! this.CopyOutRawCoreAsync(copySql, defaultArg cancellationToken CancellationToken.None)
+            with
+            | :? PostgresException as ex -> return raise ex
+            | ex -> invalidate (); return raise ex
+        }
+
     /// COPY ... TO STDOUT decoded as text lines.
     member this.CopyOutTextAsync(copySql: string, ?cancellationToken: CancellationToken) : Task<string list> =
         task {
             let! chunks = this.CopyOutRawAsync(copySql, ?cancellationToken = cancellationToken)
-            let all = chunks |> Array.concat |> utf8.GetString
+            let all = chunks |> Array.concat |> dataEncoding.GetString
             return all.Split('\n') |> Array.filter (fun l -> l <> "") |> List.ofArray
         }
 
@@ -983,10 +1083,7 @@ type Connection(config: ConnConfig) =
                             let pid, ch, payload = parseNotification m
                             result <- Some { Pid = pid; Channel = ch; Payload = payload }
                             looping <- false
-                        | 'S' -> // ParameterStatus
-                            m.CString() |> ignore
-                            m.CString() |> ignore
-                        | 'N' -> () // NoticeResponse
+                        | _ when handleAsyncMessage m -> ()
                         | _ -> ()
                     return result
                 with :? OperationCanceledException ->
@@ -1016,7 +1113,7 @@ type Connection(config: ConnConfig) =
                 let! m = transport.ReadMessageAsync(tok)
                 match m.Tag with
                 | 'V' -> result <- parseFunctionResult m
-                | 'N' -> ()
+                | _ when handleAsyncMessage m -> ()
                 | 'E' -> err <- Some(ErrorFields.parse m)
                 | 'Z' -> ready <- true
                 | _ -> ()
@@ -1026,6 +1123,14 @@ type Connection(config: ConnConfig) =
         }
 
     // ---- Streaming replication ----------------------------------------------
+
+    /// Mark WAL through this LSN as durably flushed and applied by the consumer.
+    /// Only call after persisting and applying it; server walEnd is not an
+    /// acknowledgement position. The default is zero (nothing acknowledged).
+    member _.AcknowledgeReplication(lsn: int64) =
+        if lsn < replicationAcknowledged then
+            invalidArg "lsn" "Replication acknowledgement must not move backwards."
+        replicationAcknowledged <- lsn
 
     /// Send a Standby Status Update ('r' inside CopyData) acknowledging `lsn`.
     member private _.SendStandbyStatusAsync(lsn: int64, ct: CancellationToken) : Task =
@@ -1040,13 +1145,13 @@ type Connection(config: ConnConfig) =
 
     /// Run a START_REPLICATION command and stream the WAL. `handler` is called
     /// with (walEnd, payload) for each XLogData message; return false from it to
-    /// stop. Keepalives are answered with a standby status update. Works for
-    /// both logical (test_decoding payloads are text) and physical streams.
-    member this.StreamReplicationAsync
-        (command: string, handler: int64 * byte[] -> bool, ?cancellationToken: CancellationToken)
+    /// stop. Call AcknowledgeReplication only after durable consumer processing;
+    /// absent an explicit acknowledgement, updates report zero.
+    member private this.StreamReplicationCoreAsync
+        (command: string, handler: int64 * byte[] -> bool, ct: CancellationToken)
         : Task =
         task {
-            let ct = defaultArg cancellationToken CancellationToken.None
+            replicationAcknowledged <- 0L
             do! transport.SendAsync(query dataEncoding command, ct)
 
             // Await CopyBothResponse 'W' (or an error).
@@ -1061,11 +1166,12 @@ type Connection(config: ConnConfig) =
                     starting <- false
                 | _ -> ()
             match startErr with
-            | Some e -> return raise (PostgresException e)
+            | Some e ->
+                do! this.DrainToReadyAsync(ct)
+                return raise (PostgresException e)
             | None -> ()
 
             // Stream CopyData until the handler stops or the server ends the COPY.
-            let mutable lastLsn = 0L
             let mutable stopRequested = false
             let mutable streaming = true
             let mutable streamErr : PostgresErrorFields option = None
@@ -1078,36 +1184,54 @@ type Connection(config: ConnConfig) =
                     | 'w' -> // XLogData: 'w' walStart(8) walEnd(8) sendTime(8) data
                         let walEnd = BinaryPrimitives.ReadInt64BigEndian(ReadOnlySpan<byte>(body, 9, 8))
                         let data = body.[25..]
-                        if walEnd > lastLsn then lastLsn <- walEnd
-                        if not (handler (walEnd, data)) then
+                        // walEnd describes the server's WAL, not consumer progress.
+                        let keepGoing =
+                            try handler (walEnd, data)
+                            with ex -> invalidate (); raise ex
+                        if not keepGoing then
                             stopRequested <- true
                             streaming <- false
                     | 'k' -> // primary keepalive: 'k' walEnd(8) sendTime(8) replyRequested(1)
-                        let walEnd = BinaryPrimitives.ReadInt64BigEndian(ReadOnlySpan<byte>(body, 1, 8))
-                        if walEnd > lastLsn then lastLsn <- walEnd
+                        // The keepalive walEnd is not a consumer acknowledgement.
                         if body.[17] <> 0uy then
-                            do! this.SendStandbyStatusAsync(lastLsn, ct)
+                            do! this.SendStandbyStatusAsync(replicationAcknowledged, ct)
                     | _ -> ()
                 | 'c' -> streaming <- false // server CopyDone
                 | 'E' ->
                     streamErr <- Some(ErrorFields.parse m)
                     streaming <- false
-                | _ -> ()
+                | _ -> handleAsyncMessage m |> ignore
 
             match streamErr with
-            | Some e -> return raise (PostgresException e)
+            | Some e ->
+                do! this.DrainToReadyAsync(ct)
+                return raise (PostgresException e)
             | None ->
                 // Acknowledge and end the COPY; drain to ReadyForQuery.
                 if stopRequested then
-                    do! this.SendStandbyStatusAsync(lastLsn, ct)
-                    do! transport.SendAsync(copyDone (), ct)
+                    do! this.SendStandbyStatusAsync(replicationAcknowledged, ct)
+                do! transport.SendAsync(copyDone (), ct)
+                let mutable finalError : PostgresErrorFields option = None
                 let mutable ready = false
                 while not ready do
                     let! m = transport.ReadMessageAsync(ct)
                     match m.Tag with
                     | 'Z' -> ready <- true
-                    | 'E' -> return raise (PostgresException(ErrorFields.parse m))
-                    | _ -> ()
+                    | 'E' -> finalError <- Some(ErrorFields.parse m)
+                    | _ -> handleAsyncMessage m |> ignore
+                match finalError with
+                | Some e -> return raise (PostgresException e)
+                | None -> ()
+        }
+
+    member this.StreamReplicationAsync
+        (command: string, handler: int64 * byte[] -> bool, ?cancellationToken: CancellationToken) : Task =
+        task {
+            try
+                do! this.StreamReplicationCoreAsync(command, handler, defaultArg cancellationToken CancellationToken.None)
+            with
+            | :? PostgresException as ex -> return raise ex
+            | ex -> invalidate (); return raise ex
         }
 
     // ---- Teardown ------------------------------------------------------------

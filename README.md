@@ -22,14 +22,14 @@ Rbt.Postgres.slnx
 | **Errors** | typed `PostgresException` exposing every ErrorResponse field (SQLSTATE, detail, hint, position, constraint, schema/table/column, …); notices |
 | **Simple query** | multi-statement results, full message handling, error recovery |
 | **Extended query** | named prepared statements + portals, statement cache, Describe metadata, `Close`/`Flush`, explicit/inferred param types |
-| **Typed decoding** | binary format for fixed-width types, text for the rest; native .NET values (int/bool/float/decimal/`Guid`/`DateOnly`/`DateTime`/`DateTimeOffset`/`byte[]`/`interval`→`PgInterval`/ranges→`PgRange`/nested & multi-dimensional arrays); NULLs. Types with no canonical .NET shape (inet, geometric, …) decode to faithful text |
+| **Typed decoding** | binary format for fixed-width types, text for the rest; native .NET values (int/bool/float/decimal/`Guid`/`DateOnly`/`DateTime`/`DateTimeOffset`/`TimeSpan`/`byte[]`/`interval`→`PgInterval`/ranges→`PgRange`/nested & multi-dimensional arrays); NULLs. Types with no canonical .NET shape (inet, geometric, …) decode to faithful text |
 | **Parameters** | sent in **binary** for types with a binary encoder (int/bool/float/`bytea`/`uuid`/date-time), text otherwise — chosen per the parameter's type OID |
-| **Encodings** | `client_encoding` resolved from the server and applied in both directions — SQL text, value decoding, and text params (UTF8, LATIN1, …) |
+| **Encodings** | `client_encoding` resolved from the server and applied to SQL, text parameters, row values, column names, notifications, and error/notice fields (UTF8, LATIN1, …) |
 | **Streaming** | row-limited `IAsyncEnumerable<PgRow>` cursor (bounded memory) |
 | **Row-limited execute** | `ExecuteLimitedAsync` returns at most N rows and whether more were left, under the command timeout |
 | **Notices** | NoticeResponse messages arrive on `Connection.NoticeReceived`; nothing is written to the console |
 | **COPY** | `COPY FROM/TO STDIN` in text and binary formats |
-| **Cancellation** | graceful: a fired `CancellationToken`/timeout sends a server `CancelRequest` and drains the query cleanly, so the connection stays usable; explicit `CancelAsync()` too |
+| **Cancellation** | query tokens/timeouts send a server `CancelRequest` and consume the completed response; interrupted streaming or local decoding/producer failures invalidate the connection if safe reuse cannot be guaranteed; explicit `CancelAsync()` too |
 | **LISTEN/NOTIFY** | async notifications via event + `WaitForNotificationAsync` |
 | **Liveness** | cheap no-round-trip `Connection.IsHealthy` check |
 | **Function call** | legacy `FunctionCall`/`FunctionCallResponse` protocol |
@@ -64,7 +64,7 @@ suite additionally unit-tests the GSS message framing.
 # 2. Build everything
 dotnet build -c Release
 
-# 3. Run the integration tests against the container (38 tests)
+# 3. Run the integration and regression tests against the container
 dotnet test -c Release
 
 # 4. Run the console demo
@@ -120,9 +120,33 @@ pooling, connection-string parsing, multi-host/failover — are deliberately lef
 out; build them on top of `Connection` (a pool is a generic object pool whose
 only PostgreSQL-specific touch is a `DISCARD ALL` reset).
 
+### Replication acknowledgments
+
+Replication never treats the server's WAL end as consumer progress. Call
+`conn.AcknowledgeReplication(lsn)` only after the corresponding changes have
+been durably flushed and applied. For pgoutput, acknowledge a processed
+`Commit` message's `endLsn`; the `walEnd` supplied to the stream callback is
+not an acknowledgment position. Acknowledgment starts at zero for each stream.
+Without explicit acknowledgment, the slot retains WAL for replay.
+
+Pgoutput tuple fields distinguish `Null`, `UnchangedToast`, `Text`, and `Binary`.
+An unchanged TOAST value must retain the previous column value; it is not SQL
+NULL. Binary fields retain their original bytes.
+
+### Time values
+
+PostgreSQL `time` values decode to `TimeSpan`, including `24:00:00` as one day.
+Both `TimeOnly` and `TimeSpan` parameters are accepted; values must be within
+zero through 24 hours and have microsecond precision.
+
+### Authentication work limit
+
+SCRAM authentication accepts at most 1,000,000 PBKDF2 iterations per challenge
+to bound work requested by an unauthenticated server.
+
 ## Limitations / known gaps
 
-Honest boundaries. None affect the supported feature set; they're scope edges.
+Supported representations and protocol boundaries:
 
 - **GSS transport encryption** (`gssencmode` / `GSSENCRequest` + `gss_wrap`):
   not implemented. GSS/Kerberos *authentication* is implemented and verified
@@ -136,9 +160,11 @@ Honest boundaries. None affect the supported feature set; they're scope edges.
   For any of these, register your own codec — `Codecs.registerText 869 (fun s ->
   box (IPAddress.Parse s))` — and `QueryTyped` will return your type. This escape
   hatch covers every type without rbt-postgres having to model all of them.
-- **`numeric`** decodes via text → `decimal` (lossless), not the binary format.
+- **`numeric`** uses `decimal`: values outside its range or exact precision are
+  rejected rather than rounded. Use an explicitly registered codec when a
+  wider representation is needed.
 - **Binary parameters** cover the core scalar types (int/bool/float/`bytea`/
-  `uuid`/date-time); other parameter types are sent as text (also lossless).
+  `uuid`/date-time); other parameter types are sent as text.
 - **`client_encoding`** decoding covers UTF8, LATIN1, ISO-8859-15, and any name
   .NET's `Encoding.GetEncoding` resolves; exotic legacy server encodings that
   need the code-pages provider fall back to UTF-8.

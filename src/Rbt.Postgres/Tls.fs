@@ -67,13 +67,19 @@ module Tls =
     let private chainTrusted (cfg: SslConfig) (cert: X509Certificate) =
         use chain = new X509Chain()
         chain.ChainPolicy.RevocationMode <- X509RevocationMode.NoCheck
-        match cfg.RootCertPath with
-        | Some path ->
-            let root = X509CertificateLoader.LoadCertificateFromFile(path)
-            chain.ChainPolicy.TrustMode <- X509ChainTrustMode.CustomRootTrust
-            chain.ChainPolicy.CustomTrustStore.Add(root) |> ignore
-        | None -> ()
-        chain.Build(asCert2 cert)
+        // Building a chain ourselves must retain the TLS server-auth policy.
+        chain.ChainPolicy.ApplicationPolicy.Add(Oid("1.3.6.1.5.5.7.3.1")) |> ignore
+        let roots = X509Certificate2Collection()
+        try
+            match cfg.RootCertPath with
+            | Some path ->
+                roots.ImportFromPemFile(path)
+                chain.ChainPolicy.TrustMode <- X509ChainTrustMode.CustomRootTrust
+                chain.ChainPolicy.CustomTrustStore.AddRange(roots)
+            | None -> ()
+            chain.Build(asCert2 cert)
+        finally
+            for root in roots do root.Dispose()
 
     let private makeValidator (cfg: SslConfig) =
         RemoteCertificateValidationCallback(fun _ cert _ errors ->
@@ -102,7 +108,7 @@ module Tls =
     let negotiateAsync (netStream: Stream) (cfg: SslConfig) (ct: CancellationToken) : Task<TlsResult> =
         task {
             match cfg.Mode with
-            | Disable ->
+            | Disable | Allow ->
                 return { Stream = netStream; Encrypted = false; ServerCertificate = None }
             | _ ->
                 do! netStream.WriteAsync(System.ReadOnlyMemory(sslRequest), ct)
@@ -120,7 +126,7 @@ module Tls =
                         | VerifyCa
                         | VerifyFull ->
                             return failwith "Server does not support SSL, but sslmode requires it."
-                        | _ -> // Prefer / Allow: continue in plaintext
+                        | _ -> // Prefer: continue in plaintext
                             return { Stream = netStream; Encrypted = false; ServerCertificate = None }
                     | other -> return failwith $"Unexpected SSL negotiation reply byte '{other}'."
         }

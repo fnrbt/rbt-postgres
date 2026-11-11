@@ -49,7 +49,7 @@ module Messages =
           FormatCode: int }
 
     let parseRowDescription (m: IncomingMessage) : FieldDescription[] =
-        let count = m.Int16()
+        let count = m.UInt16()
         Array.init count (fun _ ->
             { Name = m.CString()
               TableOid = m.Int32()
@@ -61,12 +61,12 @@ module Messages =
 
     /// ParameterDescription ('t'): the OIDs of a prepared statement's parameters.
     let parseParameterDescription (m: IncomingMessage) : int[] =
-        let count = m.Int16()
+        let count = m.UInt16()
         Array.init count (fun _ -> m.Int32())
 
     /// One DataRow ('D'): an array of nullable column values (raw bytes).
     let parseDataRow (m: IncomingMessage) : byte[] option [] =
-        let count = m.Int16()
+        let count = m.UInt16()
         Array.init count (fun _ ->
             let len = m.Int32()
             if len < 0 then None else Some(m.Bytes len))
@@ -174,8 +174,8 @@ module Messages =
         m
 
     /// Bind with all parameters sent in text format and results requested in text.
-    let bind (portal: string) (statementName: string) (paramValues: string option list) =
-        let m = OutgoingMessage('B')
+    let bind (encoding: System.Text.Encoding) (portal: string) (statementName: string) (paramValues: string option list) =
+        let m = OutgoingMessage('B', encoding)
         m.CString(portal)
         m.CString(statementName)
         m.Int16(0) // 0 parameter format codes => all text
@@ -184,7 +184,7 @@ module Messages =
             match p with
             | None -> m.Int32(-1) // SQL NULL
             | Some s ->
-                let bytes = utf8.GetBytes(s)
+                let bytes = encoding.GetBytes(s)
                 m.Int32(bytes.Length)
                 m.Bytes(bytes)
         m.Int16(0) // 0 result format codes => all text

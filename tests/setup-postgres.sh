@@ -42,7 +42,7 @@ fi
 podman rm -f "$NAME" >/dev/null 2>&1 || true
 podman run -d --name "$NAME" \
   -e POSTGRES_USER="$PGUSER" -e POSTGRES_PASSWORD="$PGPASS" -e POSTGRES_DB="$PGDB" \
-  -p "${HOST_PORT}:5432" \
+  -p "127.0.0.1:${HOST_PORT}:5432" \
   -v "$RUNDIR:/var/run/postgresql:U" \
   "$IMAGE" \
   -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 \

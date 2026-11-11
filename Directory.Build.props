@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <FSharpCoreImplicitPackageVersion>10.1.302</FSharpCoreImplicitPackageVersion>
+  </PropertyGroup>
+</Project>

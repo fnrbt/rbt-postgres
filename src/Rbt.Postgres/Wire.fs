@@ -69,7 +69,8 @@ module Wire =
 
     // ---- Backend message reader (cursor over one message body) --------------
 
-    type IncomingMessage(tag: char, body: byte[]) =
+    type IncomingMessage(tag: char, body: byte[], ?encoding: Encoding) =
+        let enc = defaultArg encoding utf8
         let mutable pos = 0
         member _.Tag = tag
         member _.Body = body
@@ -83,6 +84,11 @@ module Wire =
                 ||| (int body.[pos + 2] <<< 8)
                 ||| (int body.[pos + 3])
             pos <- pos + 4
+            v
+
+        member _.UInt16() =
+            let v = (int body.[pos] <<< 8) ||| int body.[pos + 1]
+            pos <- pos + 2
             v
 
         member _.Int16() =
@@ -106,7 +112,7 @@ module Wire =
             let start = pos
             while body.[pos] <> 0uy do
                 pos <- pos + 1
-            let s = utf8.GetString(body, start, pos - start)
+            let s = enc.GetString(body, start, pos - start)
             pos <- pos + 1
             s
 
@@ -122,34 +128,47 @@ module Wire =
 
     // ---- Async buffered transport -------------------------------------------
 
+    /// PostgreSQL MaxAllocSize: maximum backend frame length, including Int32 length.
+    [<Literal>]
+    let MaxMessageLength = 1024 * 1024 * 1024 - 1
+
     /// Buffered, asynchronous framing over a duplex stream (NetworkStream or
     /// SslStream). Reads reuse a pooled scratch buffer; outgoing messages are
     /// batched into a single write+flush to cut round-trips and syscalls.
+
     type Transport(inner: Stream) =
         let mutable rbuf : byte[] = ArrayPool<byte>.Shared.Rent(16384)
         let mutable rpos = 0 // start of unconsumed data
         let mutable rend = 0 // end of valid data
         let wbuf = new MemoryStream()
+        let mutable encoding = utf8 :> Encoding
         let mutable disposed = false
 
         member _.Inner = inner
+        member _.Encoding with get () = encoding and set value = encoding <- value
 
         /// Ensure at least `need` contiguous bytes are buffered at rpos.
         member private _.EnsureAsync(need: int, ct: CancellationToken) : Task =
             task {
+                ct.ThrowIfCancellationRequested()
                 if rend - rpos < need then
                     // Compact unconsumed bytes to the front of the buffer.
                     if rpos > 0 then
                         Buffer.BlockCopy(rbuf, rpos, rbuf, 0, rend - rpos)
                         rend <- rend - rpos
                         rpos <- 0
-                    // Grow if the message is larger than the current buffer.
-                    if rbuf.Length < need then
-                        let bigger = ArrayPool<byte>.Shared.Rent(max need (rbuf.Length * 2))
-                        Buffer.BlockCopy(rbuf, 0, bigger, 0, rend)
-                        ArrayPool<byte>.Shared.Return(rbuf)
-                        rbuf <- bigger
+                    // Grow only once received bytes fill the buffer. A bogus but
+                    // in-range length must not allocate a gigabyte on its header.
                     while rend - rpos < need do
+                        ct.ThrowIfCancellationRequested()
+                        if rend = rbuf.Length then
+                            let nextSize =
+                                if rbuf.Length >= need / 2 then need
+                                else rbuf.Length * 2
+                            let bigger = ArrayPool<byte>.Shared.Rent(nextSize)
+                            Buffer.BlockCopy(rbuf, 0, bigger, 0, rend)
+                            ArrayPool<byte>.Shared.Return(rbuf)
+                            rbuf <- bigger
                         let! n = inner.ReadAsync(rbuf.AsMemory(rend, rbuf.Length - rend), ct)
                         if n <= 0 then
                             raise (EndOfStreamException("Connection closed by server while reading."))
@@ -159,24 +178,30 @@ module Wire =
         /// Read one framed backend message: 1-byte tag, Int32 length, body.
         member this.ReadMessageAsync(ct: CancellationToken) : Task<IncomingMessage> =
             task {
+                ct.ThrowIfCancellationRequested()
                 do! this.EnsureAsync(5, ct)
+                ct.ThrowIfCancellationRequested()
                 let tag = char rbuf.[rpos]
                 let length =
                     (int rbuf.[rpos + 1] <<< 24)
                     ||| (int rbuf.[rpos + 2] <<< 16)
                     ||| (int rbuf.[rpos + 3] <<< 8)
                     ||| (int rbuf.[rpos + 4])
+                if length < 4 || length > MaxMessageLength then
+                    raise (InvalidDataException($"Invalid backend message length: {length}."))
                 let bodyLen = length - 4
-                do! this.EnsureAsync(5 + bodyLen, ct)
+                do! this.EnsureAsync(length + 1, ct)
+                ct.ThrowIfCancellationRequested()
                 let body = if bodyLen > 0 then Array.sub rbuf (rpos + 5) bodyLen else [||]
-                rpos <- rpos + 5 + bodyLen
-                return IncomingMessage(tag, body)
+                rpos <- rpos + length + 1
+                return IncomingMessage(tag, body, encoding)
             }
 
         /// Read a single raw byte (the SSLRequest 'S'/'N' reply is unframed).
         member this.ReadRawByteAsync(ct: CancellationToken) : Task<byte> =
             task {
                 do! this.EnsureAsync(1, ct)
+                ct.ThrowIfCancellationRequested()
                 let b = rbuf.[rpos]
                 rpos <- rpos + 1
                 return b

@@ -75,7 +75,7 @@ echo "[4/4] verifying the rbt-postgres client authenticates via GSSAPI ..."
 podman exec "$NAME" bash -lc '
 set -e
 rm -rf /tmp/rbt-postgres && mkdir -p /tmp/rbt-postgres
-cp -r /work/src /work/samples /work/Rbt.Postgres.slnx /tmp/rbt-postgres/
+cp -r /work/src /work/samples /work/Rbt.Postgres.slnx /work/Directory.Build.props /tmp/rbt-postgres/
 cd /tmp/rbt-postgres
 dotnet build samples/Rbt.Postgres.Sample/Rbt.Postgres.Sample.fsproj -c Release -v quiet --nologo >/dev/null
 echo testerpw | kinit tester@EXAMPLE.COM
